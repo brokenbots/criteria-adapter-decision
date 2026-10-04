@@ -300,3 +300,43 @@ func TestDecisionNilContext(t *testing.T) {
 		t.Fatal("Decision(nil ctx) err = nil; want error")
 	}
 }
+
+func TestDecisionRejectsOversizedResponse(t *testing.T) {
+	t.Parallel()
+
+	t.Run("within cap is accepted", func(t *testing.T) {
+		t.Parallel()
+		body := "{\"x\":\"" + strings.Repeat("a", maxResponseBytes-8) + "\"}" // exactly maxResponseBytes
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(server.Close)
+
+		client := newTestClient(t, server.URL, "clef")
+		raw, err := client.Decision(context.Background(), "ready", nil)
+		if err != nil {
+			t.Fatalf("Decision() err = %v; want nil", err)
+		}
+		if len(raw) != maxResponseBytes {
+			t.Fatalf("len(raw) = %d; want %d", len(raw), maxResponseBytes)
+		}
+	})
+
+	t.Run("beyond cap is rejected", func(t *testing.T) {
+		t.Parallel()
+		oversized := "{" + strings.Repeat("a", maxResponseBytes+1) + "}" // cap + 3 bytes
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, oversized)
+		}))
+		t.Cleanup(server.Close)
+
+		client := newTestClient(t, server.URL, "clef")
+		_, err := client.Decision(context.Background(), "ready", nil)
+		if err == nil {
+			t.Fatal("Decision() err = nil; want oversized-response error")
+		}
+		if !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("Decision() err = %q; want containing %q", err.Error(), "exceeds")
+		}
+	})
+}

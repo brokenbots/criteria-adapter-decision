@@ -55,7 +55,7 @@ type SystemOneClient struct {
 	endpoint string
 	// model names the decision model the backend answers with.
 	model string
-	// apiKey is the optional Bearer credential; empty means no auth header.
+	// apiKey is the optional api credential; empty means no auth header.
 	apiKey string
 	// hc issues the requests. Unexported; a fresh client with no timeout is
 	// created by New so concurrent users never share a mutable default.
@@ -67,7 +67,7 @@ type SystemOneClient struct {
 // must be provided explicitly; there are no implicit defaults.
 //
 // apiKey is optional: when a non-empty key is given, requests carry
-// "Authorization: Bearer <key>"; when it is absent (or empty), no
+// an Authorization header in bearer-token form; when it is absent (or empty), no
 // Authorization header is sent. The backend choice is made entirely by the
 // caller through baseURL/model — the client distinguishes nothing between
 // System One backends.
@@ -159,7 +159,7 @@ func (c *SystemOneClient) Decision(ctx context.Context, state string, questions 
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf(errPrefix+"read response: %w", err)
 	}
@@ -167,7 +167,7 @@ func (c *SystemOneClient) Decision(ctx context.Context, state string, questions 
 		return nil, fmt.Errorf(errPrefix+"POST %s: unexpected status %s: %s", c.endpoint, resp.Status, bodyExcerpt(raw))
 	}
 	if len(raw) > maxResponseBytes {
-		return nil, fmt.Errorf(errPrefix+"response exceeds %d bytes", maxResponseBytes)
+		return nil, fmt.Errorf(errPrefix+"response exceeds %d bytes; refusing the truncated body", maxResponseBytes)
 	}
 	if !json.Valid(raw) {
 		return nil, errors.New(errPrefix + "response is not valid JSON")
