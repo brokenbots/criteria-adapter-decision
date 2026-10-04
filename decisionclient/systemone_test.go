@@ -15,6 +15,7 @@ import (
 // and replies with the given body.
 type decisionStub struct {
 	server   *httptest.Server
+	mu       sync.Mutex
 	recorder *recordedRequest
 }
 
@@ -34,8 +35,10 @@ func newDecisionStub(t *testing.T, responseBody string) *decisionStub {
 			http.Error(w, "stub read failure", http.StatusInternalServerError)
 			return
 		}
+		stub.mu.Lock()
 		stub.recorder.Request = r
 		stub.recorder.Body = b
+		stub.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, responseBody)
 	}))
