@@ -2,10 +2,12 @@ package decisionclient
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -339,4 +341,34 @@ func TestDecisionRejectsOversizedResponse(t *testing.T) {
 			t.Fatalf("Decision() err = %q; want containing %q", err.Error(), "exceeds")
 		}
 	})
+}
+
+func TestDecisionSafeForConcurrentUse(t *testing.T) {
+	t.Parallel()
+
+	const workers = 8
+	stub := newDecisionStub(t, `{"verdict":"ok"}`)
+	client := newTestClient(t, stub.server.URL, "clef")
+
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			raw, err := client.Decision(context.Background(), "ready", []string{"q"})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if string(raw) != `{"verdict":"ok"}` {
+				errs <- fmt.Errorf("worker %d: unexpected response %s", n, raw)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
 }
