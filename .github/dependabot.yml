@@ -1,0 +1,45 @@
+version: 2
+
+# Dependency-freshness & supply-chain policy: docs/dependency-policy.md
+#
+# Dependabot owns only the routine minor/patch lane. A Go major is a module-path
+# (/vN) change driven by `gomajor` (see `make deps-majors`), which Dependabot
+# cannot perform — majors it raises are SIGNALS, not merge-ready PRs. Freshness
+# is tracked by `make deps-outdated` (go-mod-outdated), not by this file.
+#
+# Every ecosystem carries a 7-day cooldown so a freshly-published (possibly
+# compromised) release is not ingested immediately. Security updates are exempt
+# from the cooldown by Dependabot's design.
+#
+# The criteria-adapter-proto ignore holds the documented below-latest pin from
+# docs/dependency-policy.md (ADR-0013 series locks the wire contract to the
+# proto v0.5.x line); it lifts on the table's review date.
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: github.com/brokenbots/criteria-adapter-proto
+        versions:
+          - ">= 0.6.0"
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
