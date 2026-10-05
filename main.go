@@ -240,7 +240,7 @@ func (s *decisionService) Execute(ctx context.Context, request *v2.ExecuteReques
 		if name != apiKeyName {
 			return fmt.Errorf("unknown secret input %q; this adapter declares only %q", name, apiKeyName)
 		}
-		if name == apiKeyName && value != "" {
+		if value != "" {
 			rebuilt, err := decisionclient.New(sess.baseURL, sess.model, value)
 			if err != nil {
 				return err
