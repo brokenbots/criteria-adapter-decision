@@ -97,9 +97,6 @@ type decisionService struct {
 	sessions map[string]*decisionSession
 }
 
-// Info declares the adapter identity, the api_key secret, and parallel
-// safety: sessions are immutable after open, so concurrent Executes are
-// safe.
 // adapterDescription is the one-line identity the manifest and
 // `criteria adapter list` carry. It describes the boundary contract only —
 // never configuration values, which are secret-hygiene risk.
