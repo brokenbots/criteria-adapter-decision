@@ -311,8 +311,8 @@ func TestIsBareword(t *testing.T) {
 		{in: "a.2", want: false},
 	}
 	for _, tc := range tests {
-		if got := isBareword(tc.in); got != tc.want {
-			t.Errorf("isBareword(%q) = %v; want %v", tc.in, got, tc.want)
+		if got := IsBareword(tc.in); got != tc.want {
+			t.Errorf("IsBareword(%q) = %v; want %v", tc.in, got, tc.want)
 		}
 	}
 }
