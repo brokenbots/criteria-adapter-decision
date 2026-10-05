@@ -26,7 +26,10 @@ import (
 //     land between levels (e.g. 1.1394); the decoder resolves it to the
 //     nearest level, rounding halves away from zero.
 //   - noul:   Noul is the verdict "yes" or "no" (no probabilities or
-//     confidence).
+//     confidence). The backend may report the verdict either as the
+//     documented "yes"/"no" string or, as the local Ollama backend does
+//     live, as a probability-like number in [0, 1]: values at or above 0.5
+//     read as "yes", below as "no".
 //
 // Exactly the fields matching the question type are populated; the others
 // remain zero values.
@@ -62,7 +65,7 @@ type rawAnswer struct {
 	Choice        *string             `json:"choice"`
 	Score         *json.RawMessage    `json:"score"`
 	Legend        *json.RawMessage    `json:"legend"`
-	Noul          *string             `json:"noul"`
+	Noul          *json.RawMessage    `json:"noul"`
 	Probabilities *map[string]float64 `json:"probabilities"`
 	Confidence    *float64            `json:"confidence"`
 }
@@ -203,10 +206,11 @@ func checkRawAnswer(raw *rawAnswer, q Question) (Answer, error) {
 		if raw.Noul == nil {
 			return Answer{}, errors.New(`noul answer must carry a "noul" field`)
 		}
-		if *raw.Noul != "yes" && *raw.Noul != "no" {
-			return Answer{}, fmt.Errorf("noul answer must be exactly %q or %q; got %q", "yes", "no", *raw.Noul)
+		noul, err := resolveNoul(*raw.Noul)
+		if err != nil {
+			return Answer{}, err
 		}
-		a.Noul = *raw.Noul
+		a.Noul = noul
 	}
 
 	if q.Type != TypeNoul {
@@ -327,9 +331,51 @@ func resolveLegend(raw json.RawMessage, q Question, idx int) (string, error) {
 // level-name string nor a level index → name map.
 const scoreLegendShapeError = `score answer legend must be a level name string or a level index → name map`
 
+// resolveNoul decodes a noul answer's verdict onto "yes" or "no". Both live
+// shapes are accepted:
+//
+//   - the documented verdict string, strictly "yes" or "no"; or
+//   - the probability-like number the local Ollama backend reports live
+//     ({"noul": 0.78}): a value in [0, 1] that reads "yes" at 0.5 or above
+//     and "no" below, mirroring the score decoder's nearest-level rule.
+//
+// Any other JSON type — booleans, objects, arrays — is a decode defect, as
+// is every string other than exactly "yes" or "no".
+func resolveNoul(raw json.RawMessage) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", errors.New(`noul answer must carry a "noul" field`)
+	}
+	if trimmed[0] == '"' {
+		var verdict string
+		if err := json.Unmarshal(trimmed, &verdict); err != nil {
+			return "", errors.New(`noul answer must be the string "yes", the string "no", or a probability-like number in [0, 1]`)
+		}
+		if verdict != "yes" && verdict != "no" {
+			return "", fmt.Errorf("noul answer must be exactly %q or %q; got %q", "yes", "no", verdict)
+		}
+		return verdict, nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(trimmed, &number); err != nil {
+		return "", errors.New(`noul answer must be the string "yes", the string "no", or a probability-like number in [0, 1]`)
+	}
+	value, err := number.Float64()
+	if err != nil {
+		return "", fmt.Errorf("noul answer %s is not a probability-like number in [0, 1]: %w", number.String(), err)
+	}
+	if value < 0 || value > 1 {
+		return "", fmt.Errorf("noul answer %s is outside [0, 1]", number.String())
+	}
+	if value >= 0.5 {
+		return "yes", nil
+	}
+	return "no", nil
+}
+
 // requireAbsent rejects cross-type fields with a message naming the
-// question type and the offending field. Raw-message fields (score, legend)
-// count a JSON null as absent, matching the package-wide "null counts as
+// question type and the offending field. Raw-message fields (score, legend,
+// noul) count a JSON null as absent, matching the package-wide "null counts as
 // absent" convention. The "type" field needs no case: every answer carries
 // it and it is checked against the question's type before this helper runs.
 func requireAbsent(raw *rawAnswer, q Question, fields ...string) error {
