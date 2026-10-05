@@ -1,7 +1,9 @@
 // Command criteria-adapter-decision is the standalone out-of-process decision
 // adapter binary. This scaffold serves the protocol-v2 decision adapter via
-// the public Go SDK with sessions wired and execution fail-closed: Execute
-// returns an error until the System One decision path lands (Kanboard 202-206).
+// the public Go SDK: sessions are wired, Execute validates its questions and
+// state inputs strictly and fail-closed (ADR-0013 M2, Kanboard 201), and
+// decision execution returns an error until the System One decision path
+// lands (Kanboard 202-206).
 //
 // The System One client itself (the isolated HTTP client for the ADR-0013
 // decision wire format) lives in decisionclient and is ready to be wired into
@@ -10,9 +12,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/brokenbots/criteria-adapter-decision/decisionclient"
 	v2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
 	adapterhost "github.com/brokenbots/criteria-go-adapter-sdk/adapterhost"
 )
@@ -56,6 +60,26 @@ func (s *decisionService) Execute(_ context.Context, request *v2.ExecuteRequest,
 	s.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("unknown session %q", request.GetSessionId())
+	}
+	// Strict fail-closed input validation (ADR-0013 M2, Kanboard 201): the
+	// step request must carry the questions and state JSON, and everything
+	// malformed — unknown keys, wrong shapes, missing criteria — fails the
+	// step here, before any decision work or HTTP traffic happens. The
+	// parsed values are re-derived by the System One path (202-206).
+	input := request.GetInput()
+	questionsJSON, ok := input["questions"]
+	if !ok {
+		return errors.New(`input must carry a "questions" key containing the questions JSON (see decisionclient.ParseQuestions)`)
+	}
+	stateJSON, ok := input["state"]
+	if !ok {
+		return errors.New(`input must carry a "state" key containing the state JSON (see decisionclient.ParseState)`)
+	}
+	if _, err := decisionclient.ParseQuestions([]byte(questionsJSON)); err != nil {
+		return err
+	}
+	if _, err := decisionclient.ParseState([]byte(stateJSON)); err != nil {
+		return err
 	}
 	// Fail-closed scaffold: the System One decision path lands in Kanboard
 	// 202-206; until then Execute must err rather than guess an outcome.
