@@ -280,10 +280,50 @@ func quotedQuestionTypes() string {
 	return string(quoted)
 }
 
-// MarshalJSON renders the question exactly as the wire contract defines it:
+// wireQuestion is the id-less wire view of one validated question for the
+// request questions map: on the System One wire the questions map is keyed
+// by question id and each entry repeats no id field — the entry shape is
+// exactly {type, instructions, criteria}.
+type wireQuestion struct {
+	Type         QuestionType `json:"type"`
+	Instructions string       `json:"instructions"`
+	Criteria     any          `json:"criteria,omitempty"`
+}
+
+// questionCriteria selects the criteria payload a question carries on the
+// wire: choice options, score levels, or a noul gloss (omitted when empty).
+func questionCriteria(q Question) any {
+	switch q.Type {
+	case TypeChoice:
+		return q.Options
+	case TypeScore:
+		return q.Levels
+	case TypeNoul:
+		if q.Gloss != "" {
+			return q.Gloss
+		}
+	}
+	return nil
+}
+
+// toWireQuestions renders validated questions as the request's questions
+// map, keyed by id. Every question must pass validateQuestion (Decision
+// already validated them; this re-check keeps hand-built maps unreachable).
+func toWireQuestions(qs []Question) (map[string]wireQuestion, error) {
+	m := make(map[string]wireQuestion, len(qs))
+	for _, q := range qs {
+		if err := validateQuestion(q); err != nil {
+			return nil, fmt.Errorf(errPrefix+"questions[%q]: %w", q.ID, err)
+		}
+		m[q.ID] = wireQuestion{Type: q.Type, Instructions: q.Instructions, Criteria: questionCriteria(q)}
+	}
+	return m, nil
+}
+
+// MarshalJSON renders the question exactly as the input contract defines it:
 // {id, type, instructions, criteria}, with criteria present only when the
 // type requires or supplies it. It validates first, so hand-built questions
-// that would not pass parseQuestion cannot reach the wire either.
+// that would not pass parseQuestion cannot be marshaled either.
 func (q Question) MarshalJSON() ([]byte, error) {
 	if err := validateQuestion(q); err != nil {
 		return nil, fmt.Errorf("%s%s", errPrefix, err)
@@ -293,17 +333,7 @@ func (q Question) MarshalJSON() ([]byte, error) {
 		Type         QuestionType `json:"type"`
 		Instructions string       `json:"instructions"`
 		Criteria     any          `json:"criteria,omitempty"`
-	}{ID: q.ID, Type: q.Type, Instructions: q.Instructions}
-	switch q.Type {
-	case TypeChoice:
-		wire.Criteria = q.Options
-	case TypeScore:
-		wire.Criteria = q.Levels
-	case TypeNoul:
-		if q.Gloss != "" {
-			wire.Criteria = q.Gloss
-		}
-	}
+	}{ID: q.ID, Type: q.Type, Instructions: q.Instructions, Criteria: questionCriteria(q)}
 	return json.Marshal(wire)
 }
 

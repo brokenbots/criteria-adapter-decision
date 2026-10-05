@@ -25,13 +25,14 @@ func testFullQuestions() []Question {
 func TestDecodeDecisionResponseLosslessAndVerbatim(t *testing.T) {
 	t.Parallel()
 
-	// Deliberately asymmetric whitespace, number lexemes, and unknown-in-our
-	// model usage keys: the decode must not re-encode a single byte.
-	body := `{  "usage" : { "input_tokens":812, "output_tokens": 0, "custom":1.2300e2 }, "model": "clef-1.4.2",   "answers":[` +
-		`{"id":"q1","noul":"yes"},` +
-		`{"id":"q2","choice":"go","probabilities":{"go":0.75,"halt":0.25},"confidence":0.9},` +
-		`{"id":"q3","score":1,"legend":"high","probabilities":{"low":0.1,"high":0.9},"confidence":1}` +
-		`]}`
+	// Deliberately asymmetric whitespace, number lexemes, non-sorted answers
+	// keys, and unknown-in-our-model usage keys: the decode must not
+	// re-encode a single byte.
+	body := `{  "usage" : { "input_tokens":812, "output_tokens": 0, "custom":1.2300e2 }, "model": "clef-1.4.2",   "answers":{` +
+		`"q1":{"type":"noul","noul":"yes"},` +
+		`"q3":{"type":"score","score":1,"legend":"high","probabilities":{"low":0.1,"high":0.9},"confidence":1},` +
+		`"q2":{"type":"choice","choice":"go","probabilities":{"go":0.75,"halt":0.25},"confidence":0.9}` +
+		`}}`
 
 	resp, err := DecodeDecisionResponse([]byte(body), testFullQuestions())
 	if err != nil {
@@ -53,7 +54,7 @@ func TestDecodeDecisionResponseLosslessAndVerbatim(t *testing.T) {
 		t.Errorf("Answers[2] = %+v; want score 1 legend high", resp.Answers[2])
 	}
 
-	wantAnswersStart := `[{"id":"q1","noul":"yes"},{"id":"q2","choice":"go","probabilities":{"go":0.75,"halt":0.25},"confidence":0.9},{"id":"q3","score":1,"legend":"high","probabilities":{"low":0.1,"high":0.9},"confidence":1}]`
+	wantAnswersStart := `{"q1":{"type":"noul","noul":"yes"},"q3":{"type":"score","score":1,"legend":"high","probabilities":{"low":0.1,"high":0.9},"confidence":1},"q2":{"type":"choice","choice":"go","probabilities":{"go":0.75,"halt":0.25},"confidence":0.9}}`
 	if string(resp.AnswersJSON) != wantAnswersStart {
 		t.Errorf("AnswersJSON = %s; want byte-verbatim %s", resp.AnswersJSON, wantAnswersStart)
 	}
@@ -64,8 +65,8 @@ func TestDecodeDecisionResponseLosslessAndVerbatim(t *testing.T) {
 }
 
 // TestDecodeDecisionResponseStrictEnvelope covers the fail-closed envelope
-// rules: exact {model, answers, usage} keys, non-empty model id, array
-// answers, and an object usage.
+// rules: exact {model, answers, usage} keys, non-empty model id, map-shaped
+// answers keyed by question id, and an object usage.
 func TestDecodeDecisionResponseStrictEnvelope(t *testing.T) {
 	t.Parallel()
 
@@ -76,17 +77,17 @@ func TestDecodeDecisionResponseStrictEnvelope(t *testing.T) {
 		body    string
 		wantSub string
 	}{
-		{name: "unknown top-level key", body: `{"model":"m","answers":[],"usage":{},"extra":1}`, wantSub: `unknown field "extra"`},
-		{name: "missing model", body: `{"answers":[] ,"usage":{}}`, wantSub: `response "model" is required`},
-		{name: "empty model", body: `{"model":"","answers":[],"usage":{}}`, wantSub: `response "model" is required`},
+		{name: "unknown top-level key", body: `{"model":"m","answers":{},"usage":{},"extra":1}`, wantSub: `unknown field "extra"`},
+		{name: "missing model", body: `{"answers":{} ,"usage":{}}`, wantSub: `response "model" is required`},
+		{name: "empty model", body: `{"model":"","answers":{},"usage":{}}`, wantSub: `response "model" is required`},
 		{name: "missing answers", body: `{"model":"m","usage":{}}`, wantSub: `response "answers" is required`},
 		{name: "null answers", body: `{"model":"m","answers":null,"usage":{}}`, wantSub: `response "answers" is required`},
-		{name: "answers not an array", body: `{"model":"m","answers":{"id":"q1"},"usage":{}}`, wantSub: "answers must be a JSON array"},
-		{name: "missing usage", body: `{"model":"m","answers":[]}`, wantSub: `response "usage" is required`},
-		{name: "null usage", body: `{"model":"m","answers":[],"usage":null}`, wantSub: `response "usage" is required`},
-		{name: "usage not an object", body: `{"model":"m","answers":[],"usage":[{"t":1}]}`, wantSub: "usage must be a JSON object"},
-		{name: "no answer for question", body: `{"model":"m","answers":[],"usage":{}}`, wantSub: "no answer for question"},
-		{name: "trailing data", body: `{"model":"m","answers":[],"usage":{}} {}`, wantSub: "decode response"},
+		{name: "answers not a map", body: `{"model":"m","answers":[{"id":"q1"}],"usage":{}}`, wantSub: "answers must be a JSON map of answer objects keyed by question id"},
+		{name: "missing usage", body: `{"model":"m","answers":{}}`, wantSub: `response "usage" is required`},
+		{name: "null usage", body: `{"model":"m","answers":{},"usage":null}`, wantSub: `response "usage" is required`},
+		{name: "usage not an object", body: `{"model":"m","answers":{},"usage":[{"t":1}]}`, wantSub: "usage must be a JSON object"},
+		{name: "no answer for question", body: `{"model":"m","answers":{},"usage":{}}`, wantSub: "no answer for question"},
+		{name: "trailing data", body: `{"model":"m","answers":{},"usage":{}} {}`, wantSub: "decode response"},
 	}
 
 	for _, tc := range tests {
@@ -113,7 +114,7 @@ func TestDecodeDecisionResponseStrictEnvelope(t *testing.T) {
 func TestDecodeDecisionResponseEmptyUsageAllowed(t *testing.T) {
 	t.Parallel()
 
-	body := `{"model":"m","answers":[{"id":"q1","noul":"yes"}],"usage":{}}`
+	body := `{"model":"m","answers":{"q1":{"type":"noul","noul":"yes"}},"usage":{}}`
 	resp, err := DecodeDecisionResponse([]byte(body), []Question{{ID: "q1", Type: TypeNoul, Instructions: "Decide."}})
 	if err != nil {
 		t.Fatalf("DecodeDecisionResponse() err = %v; want nil", err)
@@ -128,7 +129,7 @@ func TestDecodeDecisionResponseEmptyUsageAllowed(t *testing.T) {
 func TestDecodeDecisionResponseRequiresQuestions(t *testing.T) {
 	t.Parallel()
 
-	_, err := DecodeDecisionResponse([]byte(`{"model":"m","answers":[],"usage":{}}`), nil)
+	_, err := DecodeDecisionResponse([]byte(`{"model":"m","answers":{},"usage":{}}`), nil)
 	if err == nil {
 		t.Fatal("DecodeDecisionResponse(nil questions) err = nil; want error")
 	}

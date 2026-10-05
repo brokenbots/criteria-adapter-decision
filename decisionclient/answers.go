@@ -5,10 +5,13 @@ package decisionclient
 // or mapping defect is an Execute error, never a silent drop.
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"sort"
+	"strconv"
 )
 
 // Answer is the validated, lossless form of one upstream answer for the
@@ -16,8 +19,12 @@ import (
 //
 //   - choice: Choice is the selected option name; Probabilities maps known
 //     options to their probabilities; Confidence is in [0, 1].
-//   - score:  Score is the zero-based level index and Legend the matching
-//     level name; Probabilities maps known levels; Confidence in [0, 1].
+//   - score:  Score is the zero-based level index the answer resolves to and
+//     Legend the matching level name; Probabilities maps known levels (by
+//     name or by zero-based level index) to their probabilities; Confidence
+//     is in [0, 1]. The wire score is a probability-weighted number that can
+//     land between levels (e.g. 1.1394); the decoder resolves it to the
+//     nearest level, rounding halves away from zero.
 //   - noul:   Noul is the verdict "yes" or "no" (no probabilities or
 //     confidence).
 //
@@ -33,20 +40,28 @@ type Answer struct {
 	Confidence    float64
 }
 
-// answersEnvelope is the strict-decode view of the upstream response: the
-// wire contract has exactly one top-level key, so unknown keys fail.
+// answersEnvelope is the strict-decode view of the upstream answers-only
+// document: the wire contract has exactly one top-level key, so unknown keys
+// fail. answers is a JSON map of answer objects keyed by question id, kept
+// raw until the per-answer strict decode.
 type answersEnvelope struct {
-	Answers []json.RawMessage `json:"answers"`
+	Answers *json.RawMessage `json:"answers"`
 }
 
-// rawAnswer is the strict-decode view of one answer object. Pointer fields
+// rawAnswer is the strict-decode view of one answer object in the answers
+// map. The map key is the question id, so no id field is carried inside the
+// object; instead every object states its question type, and the decoder
+// rejects answers whose type does not match the question's. Pointer fields
 // distinguish "key absent" from "present but invalid", which the cross-type
-// and presence checks depend on.
+// and presence checks depend on. Score and Legend stay raw: the live backend
+// reports the score as a number lexeme (integral or probability-weighted
+// float) and the legend either as a level-name string or as a level
+// index → name map, and all shapes are validated in resolveScore/resolveLegend.
 type rawAnswer struct {
-	ID            *string             `json:"id"`
+	Type          *QuestionType       `json:"type"`
 	Choice        *string             `json:"choice"`
-	Score         *int                `json:"score"`
-	Legend        *string             `json:"legend"`
+	Score         *json.RawMessage    `json:"score"`
+	Legend        *json.RawMessage    `json:"legend"`
 	Noul          *string             `json:"noul"`
 	Probabilities *map[string]float64 `json:"probabilities"`
 	Confidence    *float64            `json:"confidence"`
@@ -56,11 +71,13 @@ type rawAnswer struct {
 // questions, aligned to question order. Decoding is strict and lossless:
 //
 //   - the envelope carries exactly the "answers" key;
-//   - answer objects carry no unknown keys and no fields belonging to
-//     another question type;
+//   - answers is a JSON map of answer objects keyed by question id (map keys
+//     are unique, so each question id appears exactly once);
+//   - every answer object states the type of its question and carries no
+//     unknown keys and no fields belonging to another question type;
 //   - each payload field is present, well-formed, and range-checked;
-//   - coverage is exact — one answer per question, with duplicates and
-//     answers to unknown questions rejected.
+//   - coverage is exact — one answer per question, with answers to unknown
+//     questions rejected.
 //
 // All defects are errors; nothing is dropped or defaulted, so malformed
 // upstream answers fail the step instead of passing through silently.
@@ -72,14 +89,24 @@ func DecodeAnswers(raw []byte, questions []Question) ([]Answer, error) {
 	if err := strictUnmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf(errPrefix+"decode answers: %w", err)
 	}
-	return decodeAnswerEntries(env.Answers, questions)
+	if env.Answers == nil || jsonNull(*env.Answers) {
+		return nil, errors.New(errPrefix + `decode answers: the "answers" map keyed by question id is required`)
+	}
+
+	var entries map[string]json.RawMessage
+	if err := strictUnmarshal(*env.Answers, &entries); err != nil {
+		return nil, fmt.Errorf(errPrefix+"decode answers: answers must be a JSON map of answer objects keyed by question id: %w", err)
+	}
+	return decodeAnswerEntries(entries, questions)
 }
 
-// decodeAnswerEntries maps raw answer objects onto the validated questions,
-// aligned to question order with exact coverage. It is the shared mapping
-// core of [DecodeAnswers] (answers-only envelope) and [DecodeDecisionResponse]
-// (full {model, answers, usage} response envelope).
-func decodeAnswerEntries(entries []json.RawMessage, questions []Question) ([]Answer, error) {
+// decodeAnswerEntries maps raw answer objects (keyed by question id) onto
+// the validated questions, aligned to question order with exact coverage. It
+// is the shared mapping core of [DecodeAnswers] (answers-only envelope) and
+// [DecodeDecisionResponse] (full {model, answers, usage} response envelope).
+//
+// Error order is deterministic: answer keys are validated in sorted order.
+func decodeAnswerEntries(entries map[string]json.RawMessage, questions []Question) ([]Answer, error) {
 	byID := make(map[string]int, len(questions))
 	for i, q := range questions {
 		if _, dup := byID[q.ID]; dup {
@@ -88,30 +115,29 @@ func decodeAnswerEntries(entries []json.RawMessage, questions []Question) ([]Ans
 		byID[q.ID] = i
 	}
 
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
 	answers := make([]Answer, len(questions))
 	answered := make(map[string]bool, len(questions))
-	for i, r := range entries {
+	for _, key := range keys {
 		var rawA rawAnswer
-		if err := strictUnmarshal(r, &rawA); err != nil {
-			return nil, fmt.Errorf(errPrefix+"answers[%d]: decode answer: %w", i, err)
+		if err := strictUnmarshal(entries[key], &rawA); err != nil {
+			return nil, fmt.Errorf(errPrefix+"answers[%q]: decode answer: %w", key, err)
 		}
-		if rawA.ID == nil {
-			return nil, fmt.Errorf(errPrefix+"answers[%d]: answer id is required", i)
-		}
-		idx, ok := byID[*rawA.ID]
+		idx, ok := byID[key]
 		if !ok {
-			return nil, fmt.Errorf(errPrefix+"answers[%d]: answer for unknown question %q", i, *rawA.ID)
+			return nil, fmt.Errorf(errPrefix+"answers[%q]: answer for unknown question %q", key, key)
 		}
-		q := questions[idx]
-		if answered[q.ID] {
-			return nil, fmt.Errorf(errPrefix+"answers[%d]: duplicate answer for question %q", i, q.ID)
-		}
-		a, err := checkRawAnswer(&rawA, q)
+		a, err := checkRawAnswer(&rawA, questions[idx])
 		if err != nil {
-			return nil, fmt.Errorf(errPrefix+"answers[%d]: %w", i, err)
+			return nil, fmt.Errorf(errPrefix+"answers[%q]: %w", key, err)
 		}
 		answers[idx] = a
-		answered[q.ID] = true
+		answered[key] = true
 	}
 	for _, q := range questions {
 		if !answered[q.ID] {
@@ -122,11 +148,17 @@ func decodeAnswerEntries(entries []json.RawMessage, questions []Question) ([]Ans
 }
 
 // checkRawAnswer validates the decoded answer against its question and
-// returns the typed form. The presence matrix is exact: the payload fields
-// for the question type are required and every other type's fields are
-// cross-type errors.
+// returns the typed form. The answer must state the question's type; the
+// presence matrix is otherwise exact: the payload fields for the question
+// type are required and every other type's fields are cross-type errors.
 func checkRawAnswer(raw *rawAnswer, q Question) (Answer, error) {
 	a := Answer{QuestionID: q.ID}
+	if raw.Type == nil {
+		return Answer{}, errors.New(`answer "type" is required`)
+	}
+	if *raw.Type != q.Type {
+		return Answer{}, fmt.Errorf("answer type %q does not match the question's type %q", *raw.Type, q.Type)
+	}
 	switch q.Type {
 	case TypeChoice:
 		if len(q.Options) == 0 {
@@ -153,17 +185,16 @@ func checkRawAnswer(raw *rawAnswer, q Question) (Answer, error) {
 		if raw.Score == nil {
 			return Answer{}, errors.New(`score answer must carry a "score" field`)
 		}
-		if *raw.Score < 0 || *raw.Score >= len(q.Levels) {
-			return Answer{}, fmt.Errorf("score %d is outside the question's %d levels", *raw.Score, len(q.Levels))
+		var legend json.RawMessage
+		if raw.Legend != nil {
+			legend = *raw.Legend
 		}
-		if raw.Legend == nil || *raw.Legend == "" {
-			return Answer{}, errors.New(`score answer must carry a non-empty "legend" field`)
+		idx, name, err := resolveScore(*raw.Score, legend, q)
+		if err != nil {
+			return Answer{}, err
 		}
-		if *raw.Legend != q.Levels[*raw.Score] {
-			return Answer{}, fmt.Errorf("score answer legend %q does not match level %d (%q)", *raw.Legend, *raw.Score, q.Levels[*raw.Score])
-		}
-		a.Score = *raw.Score
-		a.Legend = *raw.Legend
+		a.Score = idx
+		a.Legend = name
 
 	case TypeNoul:
 		if err := requireAbsent(raw, q, "choice", "score", "legend", "probabilities", "confidence"); err != nil {
@@ -193,8 +224,114 @@ func checkRawAnswer(raw *rawAnswer, q Question) (Answer, error) {
 	return a, nil
 }
 
+// resolveScore decodes a score answer's score + legend pair onto the
+// question's levels, returning the resolved zero-based level index and its
+// name. The score must be a JSON number lexeme; the live System One score is
+// a probability-weighted number that can land between levels (e.g. 1.1394):
+// the score resolves to the nearest level index, rounding halves away from
+// zero. The legend — the level naming the backend reports — is accepted in
+// both live shapes and is validated against the question's levels with
+// [resolveLegend]. Negative scores and scores that resolve past the last
+// level are decode defects.
+func resolveScore(score json.RawMessage, legend json.RawMessage, q Question) (int, string, error) {
+	if len(score) == 0 || jsonNull(score) {
+		return 0, "", errors.New(`score answer must carry a "score" field`)
+	}
+	trimmed := bytes.TrimSpace(score)
+	if trimmed[0] == '"' {
+		return 0, "", errors.New("score must be a JSON number")
+	}
+	var number json.Number
+	if err := json.Unmarshal(trimmed, &number); err != nil {
+		return 0, "", errors.New("score must be a JSON number")
+	}
+	value, err := number.Float64()
+	if err != nil {
+		return 0, "", fmt.Errorf("score %q is not a number: %w", number.String(), err)
+	}
+	if value < 0 {
+		return 0, "", fmt.Errorf("score %s is outside the question's %d levels (negative)", number.String(), len(q.Levels))
+	}
+	idx := int(math.Round(value))
+	if idx < 0 || idx >= len(q.Levels) {
+		return 0, "", fmt.Errorf("score %s is outside the question's %d levels", number.String(), len(q.Levels))
+	}
+	name, err := resolveLegend(legend, q, idx)
+	if err != nil {
+		return 0, "", err
+	}
+	return idx, name, nil
+}
+
+// resolveLegend decodes the score answer's legend onto the question's
+// levels. Both live System One shapes are accepted:
+//
+//   - a string naming the score's resolved level ({"legend":"mid"}); or
+//   - an object mapping every level index → its name
+//     ({"legend":{"0":"low","1":"med","2":"high"}}), with names matching the
+//     question's levels exactly.
+//
+// The backend reports index-keyed legends for probability-weighted scores
+// that land between levels; decoding validates the full naming map so a
+// legend that drifts from the question's levels cannot reach the graph.
+func resolveLegend(raw json.RawMessage, q Question, idx int) (string, error) {
+	if len(raw) == 0 || jsonNull(raw) {
+		return "", errors.New(`score answer must carry a non-empty "legend" field`)
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if trimmed[0] == '"' {
+		var name string
+		if err := json.Unmarshal(trimmed, &name); err != nil {
+			return "", errors.New(scoreLegendShapeError)
+		}
+		if name == "" {
+			return "", errors.New(`score answer must carry a non-empty "legend" field`)
+		}
+		if name != q.Levels[idx] {
+			return "", fmt.Errorf("score answer legend %q does not match level %d (%q)", name, idx, q.Levels[idx])
+		}
+		return name, nil
+	}
+	if trimmed[0] != '{' {
+		return "", errors.New(scoreLegendShapeError)
+	}
+	var legend map[string]string
+	if err := json.Unmarshal(trimmed, &legend); err != nil {
+		return "", fmt.Errorf("score answer legend must map level index → level name: %w", err)
+	}
+	seen := make(map[int]bool, len(legend))
+	for key, name := range legend {
+		i, err := strconv.Atoi(key)
+		if err != nil || i < 0 || i >= len(q.Levels) {
+			return "", fmt.Errorf("score answer legend key %q is not a level index in [0, %d)", key, len(q.Levels))
+		}
+		if seen[i] {
+			return "", fmt.Errorf("score answer legend repeats level index %d", i)
+		}
+		seen[i] = true
+		if name != q.Levels[i] {
+			return "", fmt.Errorf("score answer legend names level %d as %q, want %q", i, name, q.Levels[i])
+		}
+	}
+	if len(seen) != len(q.Levels) {
+		for i, level := range q.Levels {
+			if !seen[i] {
+				return "", fmt.Errorf("score answer legend is missing level %d (%q)", i, level)
+			}
+		}
+	}
+	return q.Levels[idx], nil
+}
+
+// scoreLegendShapeError is the shape message for a legend that is neither a
+// level-name string nor a level index → name map.
+const scoreLegendShapeError = `score answer legend must be a level name string or a level index → name map`
+
 // requireAbsent rejects cross-type fields with a message naming the
-// question type and the offending field.
+// question type and the offending field. Raw-message fields (score, legend)
+// count a JSON null as absent, matching the package-wide "null counts as
+// absent" convention. The "type" field needs no case: every answer carries
+// it and it is checked against the question's type before this helper runs.
 func requireAbsent(raw *rawAnswer, q Question, fields ...string) error {
 	for _, field := range fields {
 		var present bool
@@ -202,9 +339,9 @@ func requireAbsent(raw *rawAnswer, q Question, fields ...string) error {
 		case "choice":
 			present = raw.Choice != nil
 		case "score":
-			present = raw.Score != nil
+			present = raw.Score != nil && !jsonNull(*raw.Score)
 		case "legend":
-			present = raw.Legend != nil
+			present = raw.Legend != nil && !jsonNull(*raw.Legend)
 		case "noul":
 			present = raw.Noul != nil
 		case "probabilities":
@@ -231,8 +368,11 @@ func checkConfidence(raw *float64, q Question) (float64, error) {
 }
 
 // checkProbabilities validates the required, non-empty probabilities map:
-// every key must be a known option (choice) or level (score) and every
-// value must be in [0, 1].
+// every key must be known for the question's type and every value must be in
+// [0, 1]. Choice answers key probabilities by option name. Score answers key
+// them by level name or by zero-based level index ("0", "1", ...) — the
+// index-keyed form is a live System One shape that accompanies index-keyed
+// legends for probability-weighted scores.
 func checkProbabilities(raw *map[string]float64, q Question) (map[string]float64, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("%s answer must carry a \"probabilities\" field", q.Type)
@@ -244,8 +384,14 @@ func checkProbabilities(raw *map[string]float64, q Question) (map[string]float64
 	for _, key := range criteriaKeys(q) {
 		known[key] = true
 	}
+	indexKeys := make(map[string]bool)
+	if q.Type == TypeScore {
+		for i := range q.Levels {
+			indexKeys[strconv.Itoa(i)] = true
+		}
+	}
 	for key, value := range *raw {
-		if !known[key] {
+		if !known[key] && !indexKeys[key] {
 			return nil, fmt.Errorf("probabilities key %q is not one of the question's %s", key, criteriaKind(q))
 		}
 		if !unitRange(value) {

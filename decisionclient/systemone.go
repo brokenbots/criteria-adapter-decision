@@ -45,11 +45,13 @@ const maxResponseBytes = 16 << 20 // 16 MiB
 const maxErrorBodyBytes = 512
 
 // systemOneRequest is the System One request wire shape. Field order is the
-// wire order (encoding/json marshals struct fields in declaration order).
+// wire order (encoding/json marshals struct fields in declaration order);
+// the questions map is keyed by question id and marshals with sorted keys,
+// so the wire bytes are deterministic for a given request.
 type systemOneRequest struct {
-	Model     string     `json:"model"`
-	State     State      `json:"state"`
-	Questions []Question `json:"questions"`
+	Model     string                  `json:"model"`
+	State     State                   `json:"state"`
+	Questions map[string]wireQuestion `json:"questions"`
 }
 
 // SystemOneClient calls a System One decision-model backend. All fields are
@@ -166,7 +168,11 @@ func (c *SystemOneClient) WithRetries(maxRetries int) *SystemOneClient {
 //
 // The request carries exactly {model, state, questions}: the configured
 // model, the state (string, object, or array — number lexemes inside
-// objects/arrays are preserved), and the questions in the order given.
+// objects/arrays are preserved), and the questions as a map keyed by
+// question id — each entry carries exactly {type, instructions, criteria}
+// (the id lives in the map key, not inside the entry), and encoding/json
+// emits the map with sorted keys, so the wire bytes are deterministic for a
+// given request.
 func (c *SystemOneClient) Decision(ctx context.Context, state State, questions []Question) (json.RawMessage, error) {
 	if ctx == nil {
 		return nil, errors.New(errPrefix + "nil context")
@@ -174,8 +180,12 @@ func (c *SystemOneClient) Decision(ctx context.Context, state State, questions [
 	if err := validateRequest(state, questions); err != nil {
 		return nil, err
 	}
+	wireQuestions, err := toWireQuestions(questions)
+	if err != nil {
+		return nil, err
+	}
 
-	rawRequest, err := json.Marshal(systemOneRequest{Model: c.model, State: state, Questions: questions})
+	rawRequest, err := json.Marshal(systemOneRequest{Model: c.model, State: state, Questions: wireQuestions})
 	if err != nil {
 		return nil, fmt.Errorf(errPrefix+"encode request: %w", err)
 	}

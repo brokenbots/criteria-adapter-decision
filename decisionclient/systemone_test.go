@@ -175,10 +175,10 @@ func TestDecisionWireShape(t *testing.T) {
 	if got := rec.Request.Header.Get("Accept"); got != "application/json" {
 		t.Fatalf("Accept = %q; want application/json", got)
 	}
-	wantBody := `{"model":"m1","state":"ready","questions":[` +
-		`{"id":"does_run_pass","type":"choice","instructions":"Pick the run outcome.","criteria":{"fail":"The run failed.","pass":"The run passed."}},` +
-		`{"id":"quality","type":"score","instructions":"Grade the run quality.","criteria":["low","high"]},` +
-		`{"id":"safe","type":"noul","instructions":"Is the run safe?"}]}`
+	wantBody := `{"model":"m1","state":"ready","questions":{` +
+		`"does_run_pass":{"type":"choice","instructions":"Pick the run outcome.","criteria":{"fail":"The run failed.","pass":"The run passed."}},` +
+		`"quality":{"type":"score","instructions":"Grade the run quality.","criteria":["low","high"]},` +
+		`"safe":{"type":"noul","instructions":"Is the run safe?"}}}`
 	if string(rec.Body) != wantBody {
 		t.Fatalf("request body = %s; want %s", rec.Body, wantBody)
 	}
@@ -320,12 +320,12 @@ func TestDecisionStateWireVariants(t *testing.T) {
 		input    State
 		wantBody string
 	}{
-		{name: "string state", input: "ready", wantBody: `{"model":"clef","state":"ready","questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
-		{name: "object state", input: map[string]any{"branch": "main", "reps": json.Number("3")}, wantBody: `{"model":"clef","state":{"branch":"main","reps":3},"questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
-		{name: "array state", input: []any{"a", json.Number("0.5")}, wantBody: `{"model":"clef","state":["a",0.5],"questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
-		{name: "empty object state", input: map[string]any{}, wantBody: `{"model":"clef","state":{},"questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
-		{name: "empty array state", input: []any{}, wantBody: `{"model":"clef","state":[],"questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
-		{name: "empty string state", input: "", wantBody: `{"model":"clef","state":"","questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
+		{name: "string state", input: "ready", wantBody: `{"model":"clef","state":"ready","questions":{"q1":{"type":"noul","instructions":"Decide."}}}`},
+		{name: "object state", input: map[string]any{"branch": "main", "reps": json.Number("3")}, wantBody: `{"model":"clef","state":{"branch":"main","reps":3},"questions":{"q1":{"type":"noul","instructions":"Decide."}}}`},
+		{name: "array state", input: []any{"a", json.Number("0.5")}, wantBody: `{"model":"clef","state":["a",0.5],"questions":{"q1":{"type":"noul","instructions":"Decide."}}}`},
+		{name: "empty object state", input: map[string]any{}, wantBody: `{"model":"clef","state":{},"questions":{"q1":{"type":"noul","instructions":"Decide."}}}`},
+		{name: "empty array state", input: []any{}, wantBody: `{"model":"clef","state":[],"questions":{"q1":{"type":"noul","instructions":"Decide."}}}`},
+		{name: "empty string state", input: "", wantBody: `{"model":"clef","state":"","questions":{"q1":{"type":"noul","instructions":"Decide."}}}`},
 	}
 
 	for _, tc := range tests {
@@ -343,9 +343,10 @@ func TestDecisionStateWireVariants(t *testing.T) {
 	}
 }
 
-// TestDecisionQuestionOrderPreserved pins the questions array to the exact
-// wire order given by the caller.
-func TestDecisionQuestionOrderPreserved(t *testing.T) {
+// TestDecisionQuestionMapSortedKeys pins the questions map to canonical
+// wire bytes: id-less entries keyed by question id, keys sorted so the same
+// call produces identical bytes every time.
+func TestDecisionQuestionMapSortedKeys(t *testing.T) {
 	t.Parallel()
 
 	stub := newDecisionStub(t, "{}")
@@ -357,9 +358,9 @@ func TestDecisionQuestionOrderPreserved(t *testing.T) {
 	if _, err := client.Decision(context.Background(), "ready", questions); err != nil {
 		t.Fatalf("Decision() err = %v; want nil", err)
 	}
-	wantBody := `{"model":"clef","state":"ready","questions":[` +
-		`{"id":"b_second","type":"noul","instructions":"Second."},` +
-		`{"id":"a_first","type":"noul","instructions":"First."}]}`
+	wantBody := `{"model":"clef","state":"ready","questions":{` +
+		`"a_first":{"type":"noul","instructions":"First."},` +
+		`"b_second":{"type":"noul","instructions":"Second."}}}`
 	if string(stub.recorder.Body) != wantBody {
 		t.Fatalf("request body = %s; want %s", stub.recorder.Body, wantBody)
 	}

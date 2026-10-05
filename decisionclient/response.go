@@ -11,7 +11,7 @@ import (
 //
 //   - Model is the versioned model id the backend reports;
 //   - Answers are the per-question answers aligned to question order;
-//   - AnswersJSON is the upstream answers array, byte-verbatim;
+//   - AnswersJSON is the upstream answers map, byte-verbatim;
 //   - UsageJSON is the upstream usage object, byte-verbatim.
 //
 // The sub-byte fields preserve exactly what the backend sent so adapters can
@@ -42,7 +42,8 @@ type decisionResponseEnvelope struct {
 //   - the envelope carries exactly the {model, answers, usage} keys, all
 //     required;
 //   - the model id is non-empty ("versioned model id");
-//   - answers is a JSON array decoded losslessly onto the questions;
+//   - answers is a JSON map of answer objects keyed by question id, decoded
+//     losslessly onto the questions;
 //   - usage is a JSON object (possibly empty), kept byte-verbatim.
 //
 // Every defect is a decode-kind [DecisionError]; nothing is dropped or
@@ -63,9 +64,9 @@ func DecodeDecisionResponse(raw []byte, questions []Question) (*DecisionResponse
 		return nil, decodeError(errPrefix + `decode response: response "answers" is required`)
 	}
 
-	var entries []json.RawMessage
+	var entries map[string]json.RawMessage
 	if err := strictUnmarshal(*env.Answers, &entries); err != nil {
-		return nil, decodeError(errPrefix+"decode response: answers must be a JSON array of answer objects: "+err.Error(), err)
+		return nil, decodeError(errPrefix+"decode response: answers must be a JSON map of answer objects keyed by question id: "+err.Error(), err)
 	}
 	if env.Usage == nil || isNullJSON(*env.Usage) {
 		return nil, decodeError(errPrefix + `decode response: response "usage" is required`)
