@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1136,4 +1140,475 @@ func TestExecuteOutcomeMappingKeepsDecisionFailures(t *testing.T) {
 	if payload.Error.Kind != decisionclient.DecisionErrorKindHTTP || payload.Error.Status != http.StatusInternalServerError {
 		t.Errorf("failure payload kind = %q status = %d; want http/500 (D6 routing is untouched by the mapping)", payload.Error.Kind, payload.Error.Status)
 	}
+}
+
+// TestInfoConfigContract pins the compile-time config contract (ADR-0013
+// D2): the exact key set, requiredness, manifest-well-known types, and the
+// explicit defaults. The host manifest parser rejects types outside
+// {string, number, boolean, object, array}, so that set is pinned here too.
+func TestInfoConfigContract(t *testing.T) {
+	resp, err := newTestService().Info(context.Background(), &v2.InfoRequest{})
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	schema := resp.GetConfigSchema()
+	if schema == nil {
+		t.Fatal("config_schema must be non-nil")
+	}
+	fields := schema.GetFields()
+	wantKeys := []string{
+		configKeyBaseURL, configKeyModel, configKeyTimeout,
+		configKeyRetries, configKeyOutcomeQuestion,
+	}
+	if len(fields) != len(wantKeys) {
+		keys := make([]string, 0, len(fields))
+		for k := range fields {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		t.Fatalf("config fields = %v; want exactly %v", keys, wantKeys)
+	}
+	for _, key := range wantKeys {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("config field %q missing", key)
+		}
+	}
+	tests := []struct {
+		name         string
+		typ          string
+		required     bool
+		hasDefault   bool
+		defaultValue string
+	}{
+		{name: "base_url", typ: "string", required: true},
+		{name: "model", typ: "string", required: true},
+		{name: "timeout", typ: "string"},
+		{name: "retries", typ: "number", hasDefault: true, defaultValue: "0"},
+		{name: "outcome_question", typ: "string"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := fields[tc.name]
+			if f.GetType() != tc.typ {
+				t.Errorf("type = %q, want %q", f.GetType(), tc.typ)
+			}
+			if f.GetRequired() != tc.required {
+				t.Errorf("required = %v, want %v", f.GetRequired(), tc.required)
+			}
+			if got := f.GetDefaultStr(); got != tc.defaultValue {
+				t.Errorf("default = %q, want %q (defaults are explicit)", got, tc.defaultValue)
+			}
+		})
+	}
+}
+
+// TestInfoInputContract pins the compile-time input contract: the exact key
+// set, api_key marked sensitive, and NO schema-level Required (secret_input
+// is validated against the same schema; requiredness is the runtime
+// fail-closed contract instead).
+func TestInfoInputContract(t *testing.T) {
+	resp, err := newTestService().Info(context.Background(), &v2.InfoRequest{})
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	fields := resp.GetInputSchema().GetFields()
+	want := map[string]struct {
+		sensitive bool
+	}{
+		"questions": {sensitive: false},
+		"state":     {sensitive: false},
+		apiKeyName:  {sensitive: true},
+	}
+	if len(fields) != len(want) {
+		keys := make([]string, 0, len(fields))
+		for k := range fields {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		t.Fatalf("input fields = %v; want exactly the keys of the contract", keys)
+	}
+	for key, wantField := range want {
+		f, ok := fields[key]
+		if !ok {
+			t.Errorf("input field %q missing", key)
+			continue
+		}
+		if f.GetType() != "string" {
+			t.Errorf("input field %q type = %q, want string", key, f.GetType())
+		}
+		if f.GetRequired() {
+			t.Errorf("input field %q required = true; schema-level requiredness would fail every secret_input overlay (the runtime contract is fail-closed instead)", key)
+		}
+		if f.GetSensitive() != wantField.sensitive {
+			t.Errorf("input field %q sensitive = %v, want %v", key, f.GetSensitive(), wantField.sensitive)
+		}
+	}
+}
+
+// TestInfoOutputContract pins the compile-time output contract: exactly
+// answers (array), usage (object), and error (object — the typed failure
+// payload; compileOutputRefs rejects refs to undeclared output keys, so
+// failure-routing workflows compile only with error declared). None is
+// Required: the emitted payload depends on the step outcome.
+func TestInfoOutputContract(t *testing.T) {
+	resp, err := newTestService().Info(context.Background(), &v2.InfoRequest{})
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	fields := resp.GetOutputSchema().GetFields()
+	want := map[string]string{
+		"answers": "array",
+		"usage":   "object",
+		"error":   "object",
+	}
+	if len(fields) != len(want) {
+		keys := make([]string, 0, len(fields))
+		for k := range fields {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		t.Fatalf("output fields = %v; want exactly the keys of the contract", keys)
+	}
+	for key, wantType := range want {
+		f, ok := fields[key]
+		if !ok {
+			t.Errorf("output field %q missing", key)
+			continue
+		}
+		if f.GetType() != wantType {
+			t.Errorf("output field %q type = %q, want %q", key, f.GetType(), wantType)
+		}
+		if f.GetRequired() {
+			t.Errorf("output field %q required = true; the emitted payload depends on the step outcome", key)
+		}
+	}
+}
+
+// TestExecuteUnknownInputKeyRejected pins the fail-closed plaintext-channel
+// hygiene: the step input carries only questions and state; everything else
+// (notably api_key) fails the step before any decision work — zero backend
+// requests, zero events — because api_key must be bound through secret_input
+// or the adapter secrets{} block, never as a plaintext input value.
+func TestExecuteUnknownInputKeyRejected(t *testing.T) {
+	const st = `"s"`
+	tests := []struct {
+		name    string
+		input   map[string]string
+		wantErr string
+	}{
+		{
+			name:    "api_key in the plaintext input channel",
+			input:   map[string]string{"questions": executeValidQuestionsJSON, "state": st, apiKeyName: "sk-should-never-reach-the-adapter"},
+			wantErr: `unknown input key "api_key"; the step input carries only "questions" and "state" (api_key is a secret — bind it via secret_input or the adapter secrets{} block)`,
+		},
+		{
+			name:    "unrelated key",
+			input:   map[string]string{"questions": executeValidQuestionsJSON, "state": st, "region": "us-east-1"},
+			wantErr: `unknown input key "region"; the step input carries only "questions" and "state"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, calls := stubBackend(t, stubExchange{body: successResponse()})
+			sink, err := callExecute(t, svc, tc.input, nil, nil)
+			if err == nil {
+				t.Fatalf("Execute(...) err = nil; want containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Execute(...) err = %q; want containing %q", err.Error(), tc.wantErr)
+			}
+			if got := atomic.LoadInt32(calls); got != 0 {
+				t.Fatalf("backend received %d request(s); want 0 (fail-closed before any HTTP traffic)", got)
+			}
+			if got := len(sink.events); got != 0 {
+				t.Fatalf("Execute emitted %d event(s); want 0 (fail-closed)", got)
+			}
+		})
+	}
+}
+
+// The manifest doc mirror: the exact shape the SDK's --emit-manifest emits,
+// decoded strictly (rejects unknown keys and trailing data). Mirrors the
+// host's strict parser (criteria main: internal/adapter/manifest) so the
+// round trip is guarded at this pre-engine-manifest gate.
+type manifestDoc struct {
+	SchemaVersion          uint32           `json:"schema_version"`
+	Name                   string           `json:"name"`
+	Version                string           `json:"version"`
+	Description            string           `json:"description"`
+	SourceURL              string           `json:"source_url"`
+	Capabilities           []string         `json:"capabilities"`
+	Platforms              []manifestPair   `json:"platforms"`
+	SDKProtocolVersion     int              `json:"sdk_protocol_version"`
+	ConfigSchema           manifestSchema   `json:"config_schema"`
+	InputSchema            manifestSchema   `json:"input_schema"`
+	OutputSchema           manifestSchema   `json:"output_schema"`
+	Secrets                []manifestSecret `json:"secrets"`
+	Permissions            []string         `json:"permissions"`
+	CompatibleEnvironments []string         `json:"compatible_environments"`
+}
+
+type manifestPair struct {
+	OS   string `json:"os"`
+	Arch string `json:"arch"`
+}
+
+type manifestSchema struct {
+	Fields map[string]manifestField `json:"fields"`
+}
+
+type manifestField struct {
+	Type        string `json:"type"`
+	Required    bool   `json:"required"`
+	Description string `json:"description"`
+	Default     string `json:"default"`
+	Sensitive   bool   `json:"sensitive"`
+}
+
+type manifestSecret struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Required    bool   `json:"required"`
+}
+
+// strictManifestDoc decodes the manifest bytes with the host's strictness:
+// unknown keys reject (the host parser rejects them too) and no trailing
+// data is tolerated.
+func strictManifestDoc(t *testing.T, raw []byte) manifestDoc {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// In go 1.27 the decoder exposes DisallowUnknownFields() as a mutator
+	// method (previously an assignable field).
+	dec.DisallowUnknownFields()
+	var doc manifestDoc
+	if err := dec.Decode(&doc); err != nil {
+		t.Fatalf("strict manifest decode: %v", err)
+	}
+	if dec.More() {
+		t.Fatal("manifest has trailing data after the JSON document")
+	}
+	return doc
+}
+
+// wellKnownFieldTypes is the host manifest parser's accepted field set;
+// anything else (bool, list types) is rejected at parse.
+var wellKnownFieldTypes = map[string]bool{
+	"string": true, "number": true, "boolean": true,
+	"object": true, "array": true,
+}
+
+var nameRE = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+
+// TestManifestRoundTrip compiles the real binary, runs the SDK's default
+// --emit-manifest, parses the document under the host's strictness, gates
+// the structural invariants the host manifest parser enforces (so the
+// manifest parses under the strict engine parser), mirrors Verify against
+// the in-process Info response, and pins byte-for-byte determinism.
+func TestManifestRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("compiles the adapter binary")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go tool not in PATH: %v", err)
+	}
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "binary")
+	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	emit := func() []byte {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		cmd := exec.Command(exe, "--emit-manifest")
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("--emit-manifest: %v\nstderr: %s", err, stderr.String())
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("--emit-manifest wrote to stderr: %q", stderr.String())
+		}
+		return stdout.Bytes()
+	}
+	first := emit()
+	doc := strictManifestDoc(t, first)
+
+	// Host manifest parser gates (manifest.Validate mirror).
+	if doc.SchemaVersion != 1 {
+		t.Errorf("schema_version = %d, want 1", doc.SchemaVersion)
+	}
+	if !nameRE.MatchString(doc.Name) {
+		t.Errorf("name %q violates the host name regex", doc.Name)
+	}
+	if doc.Name != "decision" {
+		t.Errorf("name = %q, want decision", doc.Name)
+	}
+	if doc.Version != Version {
+		t.Errorf("version = %q, want %q", doc.Version, Version)
+	}
+	if doc.SDKProtocolVersion != 2 {
+		t.Errorf("sdk_protocol_version = %d, want 2", doc.SDKProtocolVersion)
+	}
+	if doc.SourceURL == "" {
+		t.Fatal("source_url is required by the host parser")
+	}
+	if !strings.Contains(doc.SourceURL, "github.com/brokenbots/criteria-adapter-decision") {
+		t.Errorf("source_url = %q, must point at the adapter source", doc.SourceURL)
+	}
+	if len(doc.Platforms) == 0 {
+		t.Fatal("platforms are required by the host parser")
+	}
+	for _, p := range doc.Platforms {
+		if !nameRE.MatchString(p.OS) || !regexp.MustCompile(`^[a-z0-9_]+$`).MatchString(p.Arch) {
+			t.Errorf("platform %s/%s violates the host os/arch grammar", p.OS, p.Arch)
+		}
+	}
+	if len(doc.Secrets) != 1 || doc.Secrets[0].Name != apiKeyName {
+		t.Fatalf("secrets = %+v; want exactly api_key", doc.Secrets)
+	}
+
+	// Schema invariants on the emitted document.
+	schemas := map[string]manifestSchema{
+		"config_schema": doc.ConfigSchema,
+		"input_schema":  doc.InputSchema,
+		"output_schema": doc.OutputSchema,
+	}
+	for name, schema := range schemas {
+		if len(schema.Fields) == 0 {
+			t.Fatalf("%s: fields empty", name)
+		}
+		for key, field := range schema.Fields {
+			if !wellKnownFieldTypes[field.Type] {
+				t.Errorf("%s.%s: type %q not in the host well-known set", name, key, field.Type)
+			}
+			if field.Description == "" {
+				t.Errorf("%s.%s: description empty — the schema is the compile-time contract and must be self-describing", name, key)
+			}
+		}
+	}
+	// DEFAULTS EXPLICIT on the wire: base_url/model required; retries
+	// carries its default; timeout carries none (absence IS the default).
+	if doc.ConfigSchema.Fields["retries"].Default != "0" {
+		t.Errorf("retries default = %q, want %q", doc.ConfigSchema.Fields["retries"].Default, "0")
+	}
+	if _, has := doc.ConfigSchema.Fields["timeout"]; !has {
+		t.Error("timeout key missing")
+	}
+	if defaultString := doc.ConfigSchema.Fields["timeout"].Default; defaultString != "" {
+		t.Errorf("timeout default = %q; absence is the no-deadline default", defaultString)
+	}
+	if baseModel := doc.ConfigSchema.Fields; !baseModel["base_url"].Required || !baseModel["model"].Required {
+		t.Error("base_url and model must be required:true on the wire")
+	}
+	if _, has := inputSchemaFields(doc); !has {
+		t.Error("input_schema must carry api_key")
+	}
+	if doc.InputSchema.Fields[apiKeyName].Sensitive != true {
+		t.Error("api_key must be sensitive:true on the wire")
+	}
+
+	// Determinism: a second emission is byte-identical.
+	second := emit()
+	if !bytes.Equal(first, second) {
+		t.Error("--emit-manifest is not deterministic: two runs differ")
+	}
+
+	// Verify mirror: the manifest and a live Info response agree on every
+	// field the engine's handshake compares (schemas compared as
+	// type/required/sensitive triples — description/default are host-ignored).
+	info, err := newTestService().Info(context.Background(), &v2.InfoRequest{})
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if doc.Name != info.GetName() || doc.Version != info.GetVersion() || doc.SDKProtocolVersion != 2 {
+		t.Errorf("identity mismatch: manifest %s/%s/%d vs info %s/%s/2",
+			doc.Name, doc.Version, doc.SDKProtocolVersion, info.GetName(), info.GetVersion())
+	}
+	if !sameStringSet(doc.Capabilities, info.GetCapabilities()) {
+		t.Errorf("capabilities manifest %v vs info %v", doc.Capabilities, info.GetCapabilities())
+	}
+	wantPlatforms := make([]string, 0, len(info.GetPlatforms()))
+	for _, p := range doc.Platforms {
+		wantPlatforms = append(wantPlatforms, p.OS+"/"+p.Arch)
+	}
+	if !sameStringSet(wantPlatforms, info.GetPlatforms()) {
+		t.Errorf("platforms manifest %v vs info %v", wantPlatforms, info.GetPlatforms())
+	}
+	secretNames := make([]string, 0, len(doc.Secrets))
+	for _, s := range doc.Secrets {
+		secretNames = append(secretNames, s.Name)
+	}
+	wantSecrets := make([]string, 0, len(info.GetSecrets()))
+	for name := range info.GetSecrets() {
+		wantSecrets = append(wantSecrets, name)
+	}
+	if !sameStringSet(secretNames, wantSecrets) {
+		t.Errorf("secrets manifest %v vs info %v", secretNames, wantSecrets)
+	}
+	for name, manifestSchemaBlock := range map[string]manifestSchema{
+		"config_schema": doc.ConfigSchema, "input_schema": doc.InputSchema, "output_schema": doc.OutputSchema,
+	} {
+		var proto *v2.AdapterSchemaProto
+		switch name {
+		case "config_schema":
+			proto = info.GetConfigSchema()
+		case "input_schema":
+			proto = info.GetInputSchema()
+		default:
+			proto = info.GetOutputSchema()
+		}
+		if len(manifestSchemaBlock.Fields) != len(proto.GetFields()) {
+			t.Errorf("%s: manifest has %d fields, schema %d", name, len(manifestSchemaBlock.Fields), len(proto.GetFields()))
+			continue
+		}
+		for key, wire := range manifestSchemaBlock.Fields {
+			var protoField *v2.ConfigFieldProto
+			if protoField = proto.GetFields()[key]; protoField == nil {
+				t.Errorf("%s: field %q not in the Info schema", name, key)
+				continue
+			}
+			if wire.Type != protoField.GetType() || !sameStringSet(
+				boolSet(wire.Required, wire.Sensitive), boolSet(protoField.GetRequired(), protoField.GetSensitive())) {
+				t.Errorf("%s.%s: wire triple (%q,%v,%v) vs proto (%q,%v,%v)", name, key,
+					wire.Type, wire.Required, wire.Sensitive, protoField.GetType(), protoField.GetRequired(), protoField.GetSensitive())
+			}
+		}
+	}
+}
+
+// inputSchemaFields reports whether the doc carries api_key in input_schema.
+func inputSchemaFields(doc manifestDoc) (map[string]manifestField, bool) {
+	_, has := doc.InputSchema.Fields[apiKeyName]
+	return doc.InputSchema.Fields, has
+}
+
+// sameStringSet compares string slices as sets.
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]int)
+	for _, s := range a {
+		set[s]++
+	}
+	for _, s := range b {
+		set[s]--
+		if set[s] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// boolSet turns two bools into a set-style string for trivial comparison.
+func boolSet(required, sensitive bool) []string {
+	out := []string{}
+	if required {
+		out = append(out, "required")
+	}
+	if sensitive {
+		out = append(out, "sensitive")
+	}
+	return out
 }
