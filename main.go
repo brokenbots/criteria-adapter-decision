@@ -127,7 +127,7 @@ func infoConfigSchema() *v2.AdapterSchemaProto {
 		// default is applied for the endpoint or the model.
 		configKeyBaseURL: {
 			Type: "string", Required: true,
-			Description: "Required. Fully-qualified base URL of the System One endpoint; the adapter appends /v1/systemone (e.g. https://s1.typesafe.ai cloud, or a local System One-compatible endpoint such as http://localhost:8080). No default is applied.",
+			Description: "Required. Fully-qualified base URL of the System One endpoint; the adapter appends /v1/systemone (e.g. https://s1.typesafe.ai cloud, or Ollama >= v0.35.1 locally at http://localhost:11434). No default is applied.",
 		},
 		configKeyModel: {
 			Type: "string", Required: true,
@@ -190,7 +190,7 @@ func infoOutputSchema() *v2.AdapterSchemaProto {
 	return &v2.AdapterSchemaProto{Fields: map[string]*v2.ConfigFieldProto{
 		"answers": {
 			Type:        "array",
-			Description: "The per-question answers JSON array, byte-verbatim from the backend (present on outcome success). Entries are positionally aligned with the input questions and each answers[i] carries {id, type, ...value fields}: choice = {choice, [legend], [probabilities]}, score = {score}, noul = {noul}; every entry may carry a numeric confidence in [0, 1] for graph-side gating.",
+			Description: "The per-question answers JSON array, byte-verbatim from the backend (present on outcome success) and decoded strictly against the step's questions; the decode is id-based, not positional. Each answers[i] carries its question id plus exactly the payload of that question's type — choice = {choice, confidence, probabilities}, score = {score, legend, confidence, probabilities}, noul = {noul} (choice/score confidence is a finite number in [0, 1] for graph-side gating, probabilities map known options/levels onto values in [0, 1], and payload fields of other question types are rejected); the array order is the backend's, and graph-side positional indexing relies on that order.",
 		},
 		"usage": {
 			Type:        "object",

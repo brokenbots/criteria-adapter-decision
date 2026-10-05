@@ -8,29 +8,41 @@ serves the System One decision-model wire format (`POST /v1/systemone`) exposed 
 
 ## Status
 
-M1 scaffold (Kanboard 200, ADR-0013): the repo builds the protocol-v2 adapter
-binary (sessions wired, execution fail-closed — `Execute` returns an error until
-Kanboard 202-206 land) and ships the isolated System One HTTP client.
+Each milestone below describes what the adapter does today, as it was built
+(Kanboard 200-206, ADR-0013):
 
-M2 wire contract (Kanboard 201, ADR-0013): questions and state are validated
-fail-closed before any HTTP traffic (bareword ids, known types, criteria
-matching the question type, no unknown keys), and upstream answers decode
-losslessly onto typed values — every decode defect is an error, never a
-silent drop.
+- **M1 scaffold (Kanboard 200)**: the repo builds the protocol-v2 adapter
+  binary with gRPC sessions wired (`Info`, `OpenSession`, `Execute`) and ships
+  the isolated System One HTTP client next to it.
+- **M2 wire contract (Kanboard 201)**: questions and state are validated
+  fail-closed before any HTTP traffic (bareword ids, known types, criteria
+  matching the question type, no unknown keys), and upstream answers decode
+  losslessly onto typed values — every decode defect is an error, never a
+  silent drop.
 
-M3 mapping (Kanboard 202-203, ADR-0013): the session opens fail-closed — config
-keys are exact (`base_url`, `model`, `timeout`, `retries`, `outcome_question`),
-`timeout` must be a positive Go duration, `retries` a non-negative whole number
-of extra attempts (default 0) — and the `outcome_question` mapping is strict:
-the selected choice of the ONE configured choice question maps verbatim onto
-the step outcome and must be a member of that step's declared outcomes, or the
-step fails with the typed `outcome_out_of_set` payload.
+- **M3 mapping (Kanboard 202-203)**: the session opens fail-closed — config
+  keys are exact (`base_url`, `model`, `timeout`, `retries`, `outcome_question`),
+  `timeout` must be a positive Go duration, `retries` a non-negative whole number
+  of extra attempts (default 0) — and the `outcome_question` mapping is strict:
+  the selected choice of the ONE configured choice question maps verbatim onto
+  the step outcome and must be a member of that step's declared outcomes, or the
+  step fails with the typed `outcome_out_of_set` payload.
 
-M5 info surface (Kanboard 204, ADR-0013 D2/D7): the Info handshake declares the
-full compile-time config/input/output schemas, the `api_key` secret, and the
-`parallel_safe` capability; the SDK default `--emit-manifest` emits a JSON
-manifest that CI checks (schema round trip + determinism via `make
-manifest-check`).
+- **M5 info surface (Kanboard 204)**: the Info handshake declares the
+  full compile-time config/input/output schemas, the `api_key` secret, and the
+  `parallel_safe` capability; the SDK default `--emit-manifest` emits a JSON
+  manifest that CI checks (schema round trip + determinism via `make
+  manifest-check`).
+
+- **M7 docs (Kanboard 206)**: this README and
+  [docs/backends.md](docs/backends.md) document the full contract — backend
+  guide included (TypeSafe cloud keys, the Ollama model list). A separate
+  criteria-side mention tracks the cross-repo indexing.
+
+Until the series closes (Kanboard 207), the module pins
+[criteria-adapter-proto](https://github.com/brokenbots/criteria-adapter-proto)
+at v0.5.x; see [docs/dependency-policy.md](docs/dependency-policy.md) for the
+dated exception.
 
 
 ## decisionclient
@@ -51,7 +63,7 @@ state, err := decisionclient.ParseState([]byte(`{"branch":"main"}`)) // string, 
 if err != nil {
     return err // strictly validated, fail-closed
 }
-client, err := decisionclient.New("https://s1.typesafe.ai", "clef", os.Getenv("SYSTEM_ONE_API_KEY"))
+client, err := decisionclient.New("https://s1.typesafe.ai", "jev", os.Getenv("SYSTEM_ONE_API_KEY"))
 if err != nil {
     return err // base URL/model validation, or bad scheme
 }
@@ -67,6 +79,22 @@ answers, err := decisionclient.DecodeAnswers(response, questions)
 When the optional api key is omitted (or empty), requests carry no
 `Authorization` header; when a key is given, requests carry
 `Authorization: Bearer <key>`.
+
+## Backends
+
+Every backend serves the identical wire format (`POST <base_url>/v1/systemone`);
+the adapter and its client never specialize by backend — `base_url` and
+`model` name the backend explicitly, and there are no defaults:
+
+| Backend | `base_url` | Models | Credential |
+| --- | --- | --- | --- |
+| [TypeSafe AI](https://docs.typesafe.ai) (Jev) — cloud | `https://s1.typesafe.ai` | `jev` | optional `api_key`: when set, every request carries an `Authorization` bearer header; absent/empty means anonymous requests |
+| [Ollama >= v0.35.1](https://github.com/ollama/ollama/releases/tag/v0.35.1) (Clef / Clef Flash) — local | `http://localhost:11434` | `clef`, `clef-flash` | none — the endpoint is unauthenticated |
+
+The full per-backend guide — the secret-tainted `api_key` variable (D69), the
+complete config matrix, timeout/retries semantics, and what stays identical
+across backends — is [docs/backends.md](docs/backends.md).
+
 ## Adapter contract (compile-time Info schemas)
 
 The adapter's Info handshake declares the shape the compiler enforces: only
@@ -101,7 +129,7 @@ adapter "decision" "system_one" {
 # Local (Ollama >= v0.35.1 / Clef or Clef Flash): unauthenticated endpoint.
 adapter "decision" "local_system_one" {
   config {
-    base_url = "http://localhost:8080"
+    base_url = "http://localhost:11434"
     model    = "clef-flash"
   }
 }
@@ -110,7 +138,7 @@ adapter "decision" "local_system_one" {
 | Config key | Type | Description |
 | --- | --- | --- |
 | `base_url` | string, **required** | Fully-qualified base URL of the System One endpoint; the adapter appends `/v1/systemone`. No default. |
-| `model` | string, **required** | The System One decision model to invoke (e.g. `jev`, `clef`, `clef-flash`, or a versioned id). No default. |
+| `model` | string, **required** | The System One decision model to invoke (e.g. `jev` on the TypeSafe cloud or `clef`/`clef-flash` on Ollama — see [docs/backends.md](docs/backends.md)). No default. |
 | `timeout` | string | Optional per-call HTTP deadline as a positive Go duration (`45s`, `2m`). A present but invalid or zero value fails the session open. Absent = no per-call deadline. |
 | `retries` | number | Optional extra attempts for retryable failures (HTTP 429 and 5xx; Retry-After honored). Default `0`. |
 | `outcome_question` | string | Optional bareword id of the ONE choice question mapped onto the step outcome (below). |
@@ -158,12 +186,19 @@ Question-object `criteria` per type:
 
 ### Outputs and the failure payload
 
-On step success the outputs are `steps.<step>.answers` (the backend's
-answers array, byte-verbatim; entries are positionally aligned with the input
-questions and each entry carries `{id, type, ...value fields}` plus an optional
-numeric `confidence` in [0, 1]) and `steps.<step>.usage` (the backend usage
-object, byte-verbatim; may be empty). On step failure the output is
-`steps.<step>.error`, the typed failure payload:
+On step success the outputs are `steps.<step>.answers` (the backend's answers
+array, byte-verbatim; each entry carries its question's `id` plus exactly the
+payload of that question's type — `choice` = `{choice, confidence,
+probabilities}`, `score` = `{score, legend, confidence, probabilities}`,
+`noul` = `{noul}`, and nothing else: `confidence` is a finite number in [0, 1]
+for graph-side gating, `probabilities` maps the question's known
+options/levels onto values in [0, 1], and payload fields of other question
+types are rejected) and `steps.<step>.usage` (the backend usage object,
+byte-verbatim; may be empty). The adapter's outcome mapping resolves its
+question by `id`, but the answer array keeps the backend's order — graph-side
+positional indexing (`answers[0]`, below) relies on the backend answering in
+question order, so prefer matching entries by `id` when order matters. On
+step failure the output is `steps.<step>.error`, the typed failure payload:
 
 | `error.kind` | Meaning |
 | --- | --- |
@@ -183,7 +218,7 @@ failure payload example:
 "error": {
   "kind": "http",
   "status": 429,
-  "message": "systemone: 429 Too Many Requests: rate limited",
+  "message": "decisionclient: POST https://s1.typesafe.ai/v1/systemone: unexpected status 429 Too Many Requests: rate limited",
   "retryable": true
 }
 ```
@@ -233,3 +268,20 @@ gates the structure with `make manifest-check` (mirrored in-tree by
 `TestManifestRoundTrip`, which decodes under the host strict-parser
 semantics); the host engine's manifest parser (KB-180) parses the same
 document — pre-180, the emitted document is canonical JSON.
+
+## Build, test, gates
+
+The Makefile carries the same gates CI runs on every push and PR:
+
+```sh
+make build          # go build ./...
+make test           # go test -race ./...
+make vet            # go vet ./...
+make manifest-check # --emit-manifest round trip: structural gates + determinism
+make vuln-scan      # osv-scanner (version pinned), local parity with the CI osv-scan job
+```
+
+`make deps-outdated` and `make deps-majors` report dependency freshness
+(WS50); the policy and any below-latest pins — and their dated exceptions —
+live in [docs/dependency-policy.md](docs/dependency-policy.md). CI's
+`deps-report` job publishes the freshness report non-blocking on every PR.
