@@ -130,7 +130,7 @@ func decodeAnswerEntries(entries map[string]json.RawMessage, questions []Questio
 		}
 		idx, ok := byID[key]
 		if !ok {
-			return nil, fmt.Errorf(errPrefix+"answers[%q]: answer for unknown question %q", key, key)
+			return nil, fmt.Errorf(errPrefix+"answers[%q]: answer for unknown question", key)
 		}
 		a, err := checkRawAnswer(&rawA, questions[idx])
 		if err != nil {

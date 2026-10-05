@@ -177,10 +177,10 @@ func TestDecodeAnswersRejectMatrix(t *testing.T) {
 		{name: "answer missing type", raw: `{"answers":{"pick":{"choice":"pass","probabilities":{"pass":1},"confidence":0.5}}}`, wantErr: `answers["pick"]: answer "type" is required`},
 		{name: "answer type not a string", raw: `{"answers":{"pick":{"type":3,"choice":"pass","probabilities":{"pass":1},"confidence":0.5}}}`, wantErr: `answers["pick"]: decode answer: json: cannot unmarshal number`},
 		{name: "answer type mismatch", raw: `{"answers":{"pick":{"type":"noul","noul":"yes"}}}`, wantErr: `answers["pick"]: answer type "noul" does not match the question's type "choice"`},
-		{name: "answer for unknown question", raw: `{"answers":{"other":{"type":"choice","choice":"pass","probabilities":{"pass":1},"confidence":0.5}}}`, wantErr: `answers["other"]: answer for unknown question "other"`},
-		{name: "unknown answer key not a bareword", raw: `{"answers":{"does run pass":{"type":"choice","choice":"pass","probabilities":{"pass":1},"confidence":0.5}}}`, wantErr: `answers["does run pass"]: answer for unknown question "does run pass"`},
+		{name: "answer for unknown question", raw: `{"answers":{"other":{"type":"choice","choice":"pass","probabilities":{"pass":1},"confidence":0.5}}}`, wantErr: `answers["other"]: answer for unknown question`},
+		{name: "unknown answer key not a bareword", raw: `{"answers":{"does run pass":{"type":"choice","choice":"pass","probabilities":{"pass":1},"confidence":0.5}}}`, wantErr: `answers["does run pass"]: answer for unknown question`},
 		{name: "answer not an object", raw: `{"answers":{"pick":"pass"}}`, wantErr: `answers["pick"]: decode answer: json: cannot unmarshal string`},
-		{name: "answer keys validated in sorted order", raw: `{"answers":{"zzz":{"type":"noul"},"aaa":{"type":"noul"}}}`, wantErr: `answers["aaa"]: answer for unknown question "aaa"`},
+		{name: "answer keys validated in sorted order", raw: `{"answers":{"zzz":{"type":"noul"},"aaa":{"type":"noul"}}}`, wantErr: `answers["aaa"]: answer for unknown question`},
 
 		// Type-stated choice answers.
 		{name: "choice missing choice field", raw: `{"answers":{"pick":{"type":"choice","probabilities":{"pass":1},"confidence":0.5}}}`, wantErr: `answers["pick"]: choice answer must carry a non-empty "choice" field`},
