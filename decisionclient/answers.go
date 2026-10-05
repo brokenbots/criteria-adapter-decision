@@ -336,7 +336,7 @@ const scoreLegendShapeError = `score answer legend must be a level name string o
 //
 //   - the documented verdict string, strictly "yes" or "no"; or
 //   - the probability-like number the local Ollama backend reports live
-//     ({@noul: 0.78}): a value in [0, 1] that reads "yes" at 0.5 or above
+//     ({"noul": 0.78}): a value in [0, 1] that reads "yes" at 0.5 or above
 //     and "no" below, mirroring the score decoder's nearest-level rule.
 //
 // Any other JSON type — booleans, objects, arrays — is a decode defect, as
