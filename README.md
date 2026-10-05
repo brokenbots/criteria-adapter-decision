@@ -36,9 +36,8 @@ Each milestone below describes what the adapter does today, as it was built
 
 - **M7 docs (Kanboard 206)**: this README and
   [docs/backends.md](docs/backends.md) document the full contract — backend
-  guide included (TypeSafe cloud keys, the Ollama model list) — and the adapter
-  is mentioned in criteria's
-  [adapter reference](https://github.com/brokenbots/criteria/blob/main/docs/adapters.md).
+  guide included (TypeSafe cloud keys, the Ollama model list). A separate
+  criteria-side mention tracks the cross-repo indexing.
 
 Until the series closes (Kanboard 207), the module pins
 [criteria-adapter-proto](https://github.com/brokenbots/criteria-adapter-proto)
@@ -80,6 +79,7 @@ answers, err := decisionclient.DecodeAnswers(response, questions)
 When the optional api key is omitted (or empty), requests carry no
 `Authorization` header; when a key is given, requests carry
 `Authorization: Bearer <key>`.
+
 ## Backends
 
 Every backend serves the identical wire format (`POST <base_url>/v1/systemone`);
@@ -218,7 +218,7 @@ failure payload example:
 "error": {
   "kind": "http",
   "status": 429,
-  "message": "systemone: 429 Too Many Requests: rate limited",
+  "message": "decisionclient: POST https://s1.typesafe.ai/v1/systemone: unexpected status 429 Too Many Requests: rate limited",
   "retryable": true
 }
 ```
