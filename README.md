@@ -63,7 +63,7 @@ state, err := decisionclient.ParseState([]byte(`{"branch":"main"}`)) // string, 
 if err != nil {
     return err // strictly validated, fail-closed
 }
-client, err := decisionclient.New("https://s1.typesafe.ai", "jev", os.Getenv("SYSTEM_ONE_API_KEY"))
+client, err := decisionclient.New("https://api.typesafe.ai", "jev-latest", os.Getenv("SYSTEM_ONE_API_KEY"))
 if err != nil {
     return err // base URL/model validation, or bad scheme
 }
@@ -88,8 +88,8 @@ the adapter and its client never specialize by backend — `base_url` and
 
 | Backend | `base_url` | Models | Credential |
 | --- | --- | --- | --- |
-| [TypeSafe AI](https://docs.typesafe.ai) (Jev) — cloud | `https://s1.typesafe.ai` | `jev` | optional `api_key`: when set, every request carries an `Authorization` bearer header; absent/empty means anonymous requests |
-| [Ollama >= v0.35.1](https://github.com/ollama/ollama/releases/tag/v0.35.1) (Clef / Clef Flash) — local | `http://localhost:11434` | `clef`, `clef-flash` | none — the endpoint is unauthenticated |
+| [TypeSafe AI](https://docs.typesafe.ai) (Jev) — cloud | `https://api.typesafe.ai` | `jev-latest`, `jev-preview`, versioned ids | optional `api_key`: when set, every request carries an `Authorization` bearer header; absent/empty means anonymous requests |
+| [Ollama >= v0.35.1](https://github.com/ollama/ollama/releases/tag/v0.35.1) (Clef / Clef Flash / tev1) — local | `http://localhost:11434` | `clef`, `clef-flash` (local test bed: `tev1:0.8b`) | none — the endpoint is unauthenticated |
 
 The full per-backend guide — the secret-tainted `api_key` variable (D69), the
 complete config matrix, timeout/retries semantics, and what stays identical
@@ -115,8 +115,8 @@ variable "systemone_api_key" {
 # Cloud (TypeSafe AI / Jev): authenticated, per-call deadline, retry knob.
 adapter "decision" "system_one" {
   config {
-    base_url         = "https://s1.typesafe.ai" # adapter appends /v1/systemone
-    model            = "jev"                    # required; no default
+    base_url         = "https://api.typesafe.ai" # adapter appends /v1/systemone
+    model            = "jev-latest"              # required; no default
     timeout          = "45s"                    # optional; absent = no deadline ("0s" is rejected)
     retries          = 1                        # optional extra attempts; default 0
     outcome_question = "does_run_pass"          # optional; ADR-0013 D3 mapping
@@ -130,7 +130,7 @@ adapter "decision" "system_one" {
 adapter "decision" "local_system_one" {
   config {
     base_url = "http://localhost:11434"
-    model    = "clef-flash"
+    model    = "clef-flash" # GPU-light test bed pulls tev1:0.8b ("we test mechanics not models")
   }
 }
 ```
@@ -138,7 +138,7 @@ adapter "decision" "local_system_one" {
 | Config key | Type | Description |
 | --- | --- | --- |
 | `base_url` | string, **required** | Fully-qualified base URL of the System One endpoint; the adapter appends `/v1/systemone`. No default. |
-| `model` | string, **required** | The System One decision model to invoke (e.g. `jev` on the TypeSafe cloud or `clef`/`clef-flash` on Ollama — see [docs/backends.md](docs/backends.md)). No default. |
+| `model` | string, **required** | The System One decision model to invoke (`jev-latest`/`jev-preview` on the TypeSafe cloud; `clef`/`clef-flash` on Ollama, with `tev1:0.8b` as the local test bed — see [docs/backends.md](docs/backends.md)). No default. |
 | `timeout` | string | Optional per-call HTTP deadline as a positive Go duration (`45s`, `2m`). A present but invalid or zero value fails the session open. Absent = no per-call deadline. |
 | `retries` | number | Optional extra attempts for retryable failures (HTTP 429 and 5xx; Retry-After honored). Default `0`. |
 | `outcome_question` | string | Optional bareword id of the ONE choice question mapped onto the step outcome (below). |
@@ -187,18 +187,19 @@ Question-object `criteria` per type:
 ### Outputs and the failure payload
 
 On step success the outputs are `steps.<step>.answers` (the backend's answers
-array, byte-verbatim; each entry carries its question's `id` plus exactly the
-payload of that question's type — `choice` = `{choice, confidence,
-probabilities}`, `score` = `{score, legend, confidence, probabilities}`,
-`noul` = `{noul}`, and nothing else: `confidence` is a finite number in [0, 1]
-for graph-side gating, `probabilities` maps the question's known
-options/levels onto values in [0, 1], and payload fields of other question
-types are rejected) and `steps.<step>.usage` (the backend usage object,
-byte-verbatim; may be empty). The adapter's outcome mapping resolves its
-question by `id`, but the answer array keeps the backend's order — graph-side
-positional indexing (`answers[0]`, below) relies on the backend answering in
-question order, so prefer matching entries by `id` when order matters. On
-step failure the output is `steps.<step>.error`, the typed failure payload:
+map, byte-verbatim and keyed by question id; each entry carries its question's
+`type` plus exactly the payload of that question's type — `choice` =
+`{choice, confidence, probabilities}`, `score` = `{score, legend, confidence,
+probabilities}` where the live backend reports the score as a number that can
+land between levels (the legend names the resolved level, as a level-name
+string or a level index → name map) and score `probabilities` may be keyed by
+level index, `noul` = `{noul}`, and nothing else: `confidence` is a finite
+number in [0, 1] for graph-side gating, `probabilities` maps the question's
+known options/levels onto values in [0, 1], and payload fields of other
+question types are rejected) and `steps.<step>.usage` (the backend usage
+object, byte-verbatim; may be empty). Answers are looked up by question id —
+never positionally. On step failure the output is `steps.<step>.error`, the
+typed failure payload:
 
 | `error.kind` | Meaning |
 | --- | --- |
@@ -218,7 +219,7 @@ failure payload example:
 "error": {
   "kind": "http",
   "status": 429,
-  "message": "decisionclient: POST https://s1.typesafe.ai/v1/systemone: unexpected status 429 Too Many Requests: rate limited",
+  "message": "decisionclient: POST https://api.typesafe.ai/v1/systemone: unexpected status 429 Too Many Requests: rate limited",
   "retryable": true
 }
 ```
@@ -249,7 +250,7 @@ step "classify" {
 switch "gate" {
   # Confidence gating on the graph: only confident answers skip review.
   match {
-    condition = steps.classify.answers[0].confidence >= 0.85
+    condition = steps.classify.answers.does_run_pass.confidence >= 0.85
     next      = step.act
   }
   default { next = step.review }

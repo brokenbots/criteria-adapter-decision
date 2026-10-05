@@ -7,8 +7,8 @@ workflow. Two backends serve the format today:
 
 | Backend | `base_url` | Models | Credential |
 | --- | --- | --- | --- |
-| [TypeSafe AI](https://docs.typesafe.ai) (Jev) — cloud | `https://s1.typesafe.ai` | `jev` | optional `api_key` (bearer) |
-| [Ollama >= v0.35.1](https://github.com/ollama/ollama/releases/tag/v0.35.1) (Clef / Clef Flash) — local | `http://localhost:11434` | `clef`, `clef-flash` | none — endpoint is unauthenticated |
+| [TypeSafe AI](https://docs.typesafe.ai) (Jev) — cloud | `https://api.typesafe.ai` | `jev-latest`, `jev-preview`, versioned ids | optional `api_key` (bearer) |
+| [Ollama >= v0.35.1](https://github.com/ollama/ollama/releases/tag/v0.35.1) (Clef / Clef Flash / tev1) — local | `http://localhost:11434` | `clef`, `clef-flash`; local test bed: `tev1:0.8b` | none — endpoint is unauthenticated |
 
 ## TypeSafe AI (Jev) — cloud
 
@@ -25,8 +25,8 @@ variable "systemone_api_key" {
 
 adapter "decision" "system_one" {
   config {
-    base_url         = "https://s1.typesafe.ai"
-    model            = "jev"
+    base_url         = "https://api.typesafe.ai"
+    model            = "jev-latest"
     timeout          = "45s"
     retries          = 1
     outcome_question = "department"
@@ -70,6 +70,11 @@ adapter "decision" "system_one" {
 ```
 
 - Models: `clef`, `clef-flash`.
+- Test bed: the validation harness for this adapter runs against local
+  Ollama with model `tev1:0.8b` ("we test mechanics not models") on a
+  GPU-light host — any model name that resolves locally serves, and an
+  unpulled model id fails fast with a typed not-found error routed as
+  decision_failed.
 - The endpoint is unauthenticated: no `secrets{}` block at all — the same
   grammar above runs with or without a credential.
 - The endpoint URL and model list are the only backend differences; request
@@ -83,7 +88,7 @@ required keys have no fallbacks.
 | Config key | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `base_url` | string | yes | — (no default) | http/https URL, non-empty host; must not embed `user:pass` credentials; `/v1/systemone` is appended. |
-| `model` | string | yes | — (no default) | Decision model id, e.g. `jev` (cloud) or `clef`/`clef-flash` (Ollama). |
+| `model` | string | yes | — (no default) | Decision model id, e.g. `jev-latest`/`jev-preview` (cloud) or `clef`/`clef-flash` (Ollama; test bed `tev1:0.8b`). |
 | `timeout` | string | no | absent = no per-call deadline | Positive Go duration (`45s`); an invalid or `0s` value fails the session open. |
 | `retries` | number | no | `0` | Extra attempts for retryable HTTP failures (429/5xx, per `Retry-After`); must be a non-negative whole number. |
 | `outcome_question` | string | no | absent = no mapping | Bareword id of the ONE `choice` question mapped onto the step outcome; a carried question of any other type is a config error before any HTTP traffic. |
@@ -96,24 +101,30 @@ Every example in this guide spells out the required keys explicitly
 - **Request**: `POST <base_url>/v1/systemone` with `Content-Type:
   application/json` and `Accept: application/json` (+ the `Authorization`
   bearer header only when a non-empty `api_key` is configured); body
-  `{model, state, questions}` in fixed wire order, questions in the order
-  the step declares.
+  `{model, state, questions}` in fixed wire order, with `questions` a JSON
+  map keyed by question id — id-less entries, keys emitted sorted so the
+  same call produces identical bytes every time.
 - **Validation before traffic**: the strict question/state contract —
   bareword ids, known types, type-matching criteria, exact input keys, no
   unknown fields — is validated fail-closed before a connection is made.
 - **Response envelope**: exactly `{model, answers, usage}`, all required;
-  `answers` is a JSON array decoded strictly against the questions
-  (id-based, exact coverage) and both `answers` and `usage` are kept
+  `answers` is a JSON map of answer objects keyed by question id, decoded
+  strictly against the questions (exact coverage; the entry's `type` must
+  match the question's), and both `answers` and `usage` are kept
   byte-verbatim for the workflow outputs; response bodies are capped at
   16 MiB.
-- **Answers**: each entry carries its question's `id` plus exactly the
-  payload of that question's type — `choice` = `{choice, confidence,
-  probabilities}`, `score` = `{score, legend, confidence, probabilities}`,
-  `noul` = `{noul}`; nothing else. `confidence` is a finite number in [0, 1]
-  and `probabilities` map the question's known options/levels onto values
-  in [0, 1] (both required for choice/score, rejected for noul); payload
-  fields of other question types are cross-type errors. The output array
-  keeps the backend's order.
+- **Answers**: keyed by question id, each entry carries its question's
+  `type` plus exactly the payload of that question's type — `choice` =
+  `{choice, confidence, probabilities}`, `score` = `{score, legend,
+  confidence, probabilities}` (the live backend reports the score as a
+  number that can land between levels; the `legend` names the resolved
+  level as a level-name string or a level index → name map, and score
+  `probabilities` may be keyed by level index), `noul` = `{noul}`; nothing
+  else. `confidence` is a finite number in [0, 1] and `probabilities` map
+  the question's known options/levels onto values in [0, 1] (both required
+  for choice/score, rejected for noul); payload fields of other question
+  types are cross-type errors. Answers are looked up by question id, never
+  positionally.
 - **Errors**: `{kind, status, message, retryable[, allowed]}` where kind is
   `http`, `auth`, `timeout`, `decode`, `transport`, `canceled`, or — at the
   adapter level, for a mapped choice outside the step's declared outcomes —
