@@ -98,9 +98,13 @@ func strictUnmarshal(data []byte, v any) error {
 	return nil
 }
 
-// isBareword reports whether s is a bareword: non-empty ASCII letters,
-// digits, or underscores, not starting with a digit.
-func isBareword(s string) bool {
+// IsBareword reports whether s is a bareword: non-empty ASCII letters,
+// digits, or underscores, not starting a digit. This is the id grammar
+// [ParseQuestions] enforces; callers that reference a question id from
+// configuration (e.g. the adapter's outcome_question mapping) use it to
+// validate that reference fail-closed — an id outside this grammar can
+// never match a validated question.
+func IsBareword(s string) bool {
 	if s == "" {
 		return false
 	}
@@ -163,7 +167,7 @@ func parseQuestion(data []byte) (Question, error) {
 	if raw.ID == nil {
 		return Question{}, errors.New("id is required")
 	}
-	if !isBareword(*raw.ID) {
+	if !IsBareword(*raw.ID) {
 		return Question{}, fmt.Errorf("id must be a bareword (ASCII letters, digits, or underscores, not starting with a digit); got %q", *raw.ID)
 	}
 	if raw.Type == nil {
@@ -318,7 +322,7 @@ func (q *Question) UnmarshalJSON(data []byte) error {
 // known type, non-empty instructions, and a criteria payload matching the
 // type (and no stray payload from another type).
 func validateQuestion(q Question) error {
-	if !isBareword(q.ID) {
+	if !IsBareword(q.ID) {
 		return fmt.Errorf("question id must be a bareword (ASCII letters, digits, or underscores, not starting with a digit); got %q", q.ID)
 	}
 	if !validQuestionType(q.Type) {

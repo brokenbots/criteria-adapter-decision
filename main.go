@@ -4,10 +4,13 @@
 // strictly, Execute validates its questions and state inputs strictly and
 // fail-closed (ADR-0013 M2, Kanboard 201) before any HTTP traffic, then calls
 // the System One backend through the decisionclient and routes the result
-// onto the engine surface (ADR-0013 D3/D5/D6, Kanboard 202): outcome
+// onto the engine surface (ADR-0013 D3/D5/D6, Kanboard 202/203): outcome
 // "success" carries the answers and usage verbatim as outputs, every other
 // failure class maps onto outcome "failure" with a typed error payload, and
-// one adapter_event is emitted per Execute call.
+// one adapter_event is emitted per Execute call. When the session config
+// names an outcome_question (ADR-0013 D3, Kanboard 203), the selected choice
+// of that one choice question maps verbatim onto the step outcome — the only
+// semantic crossing the adapter boundary; everything else routes graph-side.
 package main
 
 import (
@@ -31,12 +34,13 @@ import (
 const Version = "2.0.0"
 
 // OpenSession config keys; base_url and model are required (decisionclient
-// applies no defaults), timeout and retries are optional.
+// applies no defaults), timeout, retries, and outcome_question are optional.
 const (
-	configKeyBaseURL = "base_url"
-	configKeyModel   = "model"
-	configKeyTimeout = "timeout"
-	configKeyRetries = "retries"
+	configKeyBaseURL         = "base_url"
+	configKeyModel           = "model"
+	configKeyTimeout         = "timeout"
+	configKeyRetries         = "retries"
+	configKeyOutcomeQuestion = "outcome_question"
 )
 
 // apiKeyName is the only secret this adapter consumes: the bearer credential
@@ -47,11 +51,19 @@ const apiKeyName = "api_key"
 
 // outcomeSuccess and outcomeFailure are the adapter's entire outcome
 // vocabulary (ADR-0013 outcome_pure): decisions either succeed with outputs
-// or fail with a typed error payload.
+// or fail with a typed error payload. It is also the only set a step's
+// allowed_outcomes may narrow to, so a mapped outcome_question choice lands
+// on one of these two outcomes.
 const (
 	outcomeSuccess = "success"
 	outcomeFailure = "failure"
 )
+
+// outcomeOutOfSetKind is the error.kind of the strict outcome_question
+// mapping's routed failure: the selected choice is not a member of the
+// step's allowed_outcomes set (same posture as the copilot adapter's
+// submit_outcome rejection).
+const outcomeOutOfSetKind = "outcome_out_of_set"
 
 // Adapter event kinds; one adapter_event is emitted per Execute call.
 const (
@@ -60,17 +72,20 @@ const (
 )
 
 // decisionSession is the immutable per-session state: the wired System One
-// client, the per-call timeout, the redaction values, and the allowed
-// outcome set. It carries no execution state — Execute is stateless and safe
-// for concurrent use over one session.
+// client, the per-call timeout, the redaction values, the allowed outcome
+// set, and the optional outcome_question (ADR-0013 D3: the one choice
+// question whose selected choice maps verbatim onto the step outcome; ""
+// = absent, every step stays outcome_pure). It carries no execution state —
+// Execute is stateless and safe for concurrent use over one session.
 type decisionSession struct {
-	client  *decisionclient.SystemOneClient
-	baseURL string
-	model   string
-	retries int
-	timeout time.Duration // 0 = no per-call timeout
-	secrets []string      // redaction values (api key; per-step overlays at Execute)
-	allowed map[string]struct{}
+	client          *decisionclient.SystemOneClient
+	baseURL         string
+	model           string
+	retries         int
+	timeout         time.Duration // 0 = no per-call timeout
+	secrets         []string      // redaction values (api key; per-step overlays at Execute)
+	allowed         map[string]struct{}
+	outcomeQuestion string // configured outcome question id ("" = outcome_pure)
 }
 
 // decisionService implements adapterhost.Service. Only the session registry
@@ -98,17 +113,27 @@ func (s *decisionService) Info(context.Context, *v2.InfoRequest) (*v2.InfoRespon
 }
 
 // OpenSession validates the session contract fail-closed: config carries
-// exactly {base_url, model, timeout, retries} with base_url/model required,
-// secrets carries at most api_key, and allowed_outcomes may only narrow to
-// the success|failure vocabulary. An opened session is wired and validated —
-// a bad base_url or model can never reach Execute.
+// exactly {base_url, model, timeout, retries, outcome_question} with
+// base_url/model required, secrets carries at most api_key, and
+// allowed_outcomes may only narrow to the success|failure vocabulary. An
+// opened session is wired and validated — a bad base_url or model can never
+// reach Execute.
+//
+// outcome_question (ADR-0013 D3) names the ONE choice question whose
+// selected choice maps onto the step outcome. Questions are per-step
+// Execute inputs here (never declared on the session's contract), so the
+// id-exists and type=choice checks run at Execute against each step's
+// questions; OpenSession validates the config value itself fail-closed —
+// it must be a bareword question id, because an id outside the question-id
+// grammar could never match a validated question and would silently
+// disable the mapping.
 func (s *decisionService) OpenSession(_ context.Context, request *v2.OpenSessionRequest) (*v2.OpenSessionResponse, error) {
 	config := request.GetConfig()
 	for key := range config {
 		switch key {
-		case configKeyBaseURL, configKeyModel, configKeyTimeout, configKeyRetries:
+		case configKeyBaseURL, configKeyModel, configKeyTimeout, configKeyRetries, configKeyOutcomeQuestion:
 		default:
-			return nil, fmt.Errorf("unknown config key %q; allowed keys: base_url, model, timeout, retries", key)
+			return nil, fmt.Errorf("unknown config key %q; allowed keys: base_url, model, timeout, retries, outcome_question", key)
 		}
 	}
 	baseURL := config[configKeyBaseURL]
@@ -134,6 +159,17 @@ func (s *decisionService) OpenSession(_ context.Context, request *v2.OpenSession
 			return nil, fmt.Errorf("config retries must be a non-negative whole number of extra attempts, got %q", raw)
 		}
 		retries = parsed
+	}
+	// An absent or empty value is the default: no outcome mapping (every
+	// step stays outcome_pure). A present value must be a bareword question
+	// id — the grammar every validated question id obeys, so anything else
+	// could never match.
+	outcomeQuestion := ""
+	if raw := config[configKeyOutcomeQuestion]; raw != "" {
+		if !decisionclient.IsBareword(raw) {
+			return nil, fmt.Errorf("config outcome_question must be a bareword question id (ASCII letters, digits, or underscores, not starting with a digit); got %q", raw)
+		}
+		outcomeQuestion = raw
 	}
 
 	var apiKey string
@@ -164,13 +200,14 @@ func (s *decisionService) OpenSession(_ context.Context, request *v2.OpenSession
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions[request.GetSessionId()] = &decisionSession{
-		client:  client,
-		baseURL: baseURL,
-		model:   model,
-		retries: retries,
-		timeout: timeout,
-		secrets: secrets,
-		allowed: allowed,
+		client:          client,
+		baseURL:         baseURL,
+		model:           model,
+		retries:         retries,
+		timeout:         timeout,
+		secrets:         secrets,
+		allowed:         allowed,
+		outcomeQuestion: outcomeQuestion,
 	}
 	return &v2.OpenSessionResponse{}, nil
 }
@@ -203,6 +240,16 @@ func checkAllowedOutcomes(allowed []string) (map[string]struct{}, error) {
 // "failure" with a typed error payload — nothing errors out of this method
 // in routed paths (M2 input validation and unknown sessions remain
 // engine-visible errors by design).
+//
+// When the session config names an outcome_question (ADR-0013 D3), the step
+// mapping applies: the selected choice of that choice question becomes the
+// step outcome verbatim, but only if it is a member of the step's
+// allowed_outcomes set — otherwise the step routes onto outcome "failure"
+// with the typed out-of-set payload. Steps whose questions don't carry the
+// configured id stay outcome_pure (always success), so one opened session
+// can serve steps with and without the question. With no outcome_question
+// configured, every step is outcome_pure and the outcome is always
+// "success" regardless of allowed_outcomes.
 func (s *decisionService) Execute(ctx context.Context, request *v2.ExecuteRequest, sink adapterhost.ExecuteEventSender) error {
 	sess := s.getSession(request.GetSessionId())
 	if sess == nil {
@@ -222,6 +269,15 @@ func (s *decisionService) Execute(ctx context.Context, request *v2.ExecuteReques
 		return errors.New(`input must carry a "state" key containing the state JSON (see decisionclient.ParseState)`)
 	}
 	questions, err := decisionclient.ParseQuestions([]byte(questionsJSON))
+	if err != nil {
+		return err
+	}
+	// ADR-0013 D3 mapping resolution: questions are per-step Execute inputs
+	// here (never declared on the session's contract), so the configured
+	// outcome question resolves per step. A step whose questions don't
+	// carry the id is an outcome_pure step; a step carrying it with a type
+	// that can't produce a choice fails closed before any HTTP traffic.
+	mappedIndex, err := mappedOutcomeIndex(sess.outcomeQuestion, questions)
 	if err != nil {
 		return err
 	}
@@ -270,6 +326,23 @@ func (s *decisionService) Execute(ctx context.Context, request *v2.ExecuteReques
 		return executeFailure(sess, request, sink, err, latency.Milliseconds())
 	}
 
+	// Outcome mapping (ADR-0013 D3): on a mapped step the selected choice
+	// of the configured question maps verbatim onto the step outcome, and
+	// only a member of that step's allowed_outcomes set may do so —
+	// anything else fails closed with the typed out-of-set payload. An
+	// outcome_pure step (no configured outcome_question, or the step's
+	// questions don't carry the configured id) always succeeds regardless
+	// of allowed_outcomes.
+	outcome := outcomeSuccess
+	if mappedIndex >= 0 {
+		choice := resp.Answers[mappedIndex].Choice
+		allowed := stepAllowedOutcomes(request.GetAllowedOutcomes())
+		if !containsOutcome(allowed, choice) {
+			return executeMappingFailure(sess, request, sink, questions[mappedIndex].ID, choice, allowed, latency.Milliseconds())
+		}
+		outcome = choice
+	}
+
 	// One adapter_event per call: the versioned model id from the response,
 	// the per-question answers, the usage, and the latency. The step state
 	// input never rides events. Best-effort secret hygiene over every
@@ -283,13 +356,58 @@ func (s *decisionService) Execute(ctx context.Context, request *v2.ExecuteReques
 		return err
 	}
 
-	// Success = outcome_pure: the outputs are exactly the upstream answers
-	// and usage, byte-verbatim — no sugar projections, no re-encoding.
+	// The outputs are exactly the upstream answers and usage, byte-verbatim
+	// — no sugar projections, no re-encoding. On a mapped step the outcome
+	// is the choice itself; the outputs never change with it.
 	outputs := fmt.Sprintf(`{"answers":%s,"usage":%s}`, resp.AnswersJSON, resp.UsageJSON)
 	return sendResult(sink, &v2.ExecuteResult{
-		Outcome:     outcomeSuccess,
+		Outcome:     outcome,
 		OutputsJson: []byte(outputs),
 	})
+}
+
+// mappedOutcomeIndex resolves the session's configured outcome_question
+// (ADR-0013 D3) against the step's validated questions. It returns the
+// index of the question the mapping reads, or -1 when this step's questions
+// don't carry the id — an outcome_pure step, not a config error, so one
+// opened session can serve steps with and without the question. A carried
+// question must be type=choice: anything else is a config error and the
+// step fails closed (before any HTTP traffic).
+func mappedOutcomeIndex(configured string, questions []decisionclient.Question) (int, error) {
+	if configured == "" {
+		return -1, nil
+	}
+	for i, q := range questions {
+		if q.ID != configured {
+			continue
+		}
+		if q.Type != decisionclient.TypeChoice {
+			return -1, fmt.Errorf("config outcome_question names question %q with type %q; the strict Choice-to-outcome mapping requires type %q", configured, q.Type, decisionclient.TypeChoice)
+		}
+		return i, nil
+	}
+	return -1, nil
+}
+
+// stepAllowedOutcomes expands a step's allowed_outcomes narrowing: the
+// empty list is the adapter's full success|failure vocabulary. The list was
+// already validated against that vocabulary (no unknown or duplicate
+// entries), so the expansion preserves the given order verbatim.
+func stepAllowedOutcomes(allowed []string) []string {
+	if len(allowed) == 0 {
+		return []string{outcomeSuccess, outcomeFailure}
+	}
+	return allowed
+}
+
+// containsOutcome reports whether allowed names the outcome want.
+func containsOutcome(allowed []string, want string) bool {
+	for _, name := range allowed {
+		if name == want {
+			return true
+		}
+	}
+	return false
 }
 
 // executeFailure routes a failed decision call onto the engine surface
@@ -302,15 +420,48 @@ func executeFailure(sess *decisionSession, request *v2.ExecuteRequest, sink adap
 	if !errors.As(err, &de) {
 		de = &decisionclient.DecisionError{Kind: decisionclient.DecisionErrorKindDecode, Message: err.Error()}
 	}
-	secrets := redactionValues(sess, request)
 	// json.Marshal of a map emits deterministic (sorted) keys, and the
 	// values are plain strings/ints/bools, so the encodes cannot fail.
-	errorData := map[string]any{
+	return routeFailure(sess, request, sink, map[string]any{
 		"kind":      string(de.Kind),
 		"status":    de.Status,
-		"message":   redactSecrets(de.Message, secrets),
+		"message":   redactSecrets(de.Message, redactionValues(sess, request)),
 		"retryable": de.Retryable,
+	}, latencyMS)
+}
+
+// executeMappingFailure routes the strict outcome_question mapping's one
+// failure (ADR-0013 D3): the selected choice is not a member of the step's
+// allowed_outcomes set. Same surface as a failed decision call — the
+// "decision.failed" adapter_event and the outcome "failure" ExecuteResult —
+// with the typed payload {error: {kind: outcome_out_of_set, allowed: [...],
+// message, status, retryable}} (same posture as the copilot adapter's
+// submit_outcome rejection; not retryable — the mapping is a strict
+// graph-side contract, and what to do about an out-of-set choice routes
+// graph-side).
+func executeMappingFailure(sess *decisionSession, request *v2.ExecuteRequest, sink adapterhost.ExecuteEventSender, questionID, choice string, allowed []string, latencyMS int64) error {
+	// The payload feeds BOTH the proto adapter_event (structpb only accepts
+	// []any of primitives) and the JSON result, so the allowed list must be
+	// []any — a []string would fall out of the event as an _encode_error.
+	allowedAny := make([]any, len(allowed))
+	for i, name := range allowed {
+		allowedAny[i] = name
 	}
+	return routeFailure(sess, request, sink, map[string]any{
+		"kind":      outcomeOutOfSetKind,
+		"status":    0,
+		"message":   redactSecrets(fmt.Sprintf("answer for question %q selected choice %q, which is not one of the step's allowed outcomes %v", questionID, choice, allowed), redactionValues(sess, request)),
+		"retryable": false,
+		"allowed":   allowedAny,
+	}, latencyMS)
+}
+
+// routeFailure emits the shared routed-failure surface: the
+// "decision.failed" adapter_event carrying the error data plus the latency,
+// then the terminal outcome "failure" ExecuteResult with the payload
+// {error: <data>}.
+func routeFailure(sess *decisionSession, request *v2.ExecuteRequest, sink adapterhost.ExecuteEventSender, errorData map[string]any, latencyMS int64) error {
+	secrets := redactionValues(sess, request)
 	if err := sendEvent(sink, eventDecisionFailed, secrets, map[string]any{
 		"error":      errorData,
 		"latency_ms": latencyMS,
