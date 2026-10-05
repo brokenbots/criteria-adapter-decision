@@ -100,15 +100,137 @@ type decisionService struct {
 // Info declares the adapter identity, the api_key secret, and parallel
 // safety: sessions are immutable after open, so concurrent Executes are
 // safe.
+// adapterDescription is the one-line identity the manifest and
+// `criteria adapter list` carry. It describes the boundary contract only —
+// never configuration values, which are secret-hygiene risk.
+const adapterDescription = "System One decision adapter: validates the step's questions and state strictly (fail-closed), sends them verbatim to a System One decision-model backend, and routes the answers and usage through as outputs — or, when the session config names an outcome_question, maps that one choice's selected choice onto the step outcome (ADR-0013 D2/D3/D7)."
+
+// infoSourceURL is the publishing source_url (D13): the manifest and the
+// publish pipeline both carry it.
+const infoSourceURL = "https://github.com/brokenbots/criteria-adapter-decision"
+
+// adapterPlatforms are the GOOS/GOARCH pairs the publish pipeline
+// cross-compiles and the manifest declares.
+func adapterPlatforms() []string {
+	return []string{"linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"}
+}
+
+// infoConfigSchema is the compile-time config contract (ADR-0013 D2): a
+// non-empty schema makes the compiler strict — only these keys are accepted
+// in the adapter config{} block, values are type-checked, and required
+// fields (base_url, model) are enforced at compile time, before any session
+// handshake.
+//
+// Field types use only the host manifest's well-known set
+// {string, number, boolean, object, array}: the SDK emits them verbatim into
+// adapter.yaml, which the host parses strictly.
+func infoConfigSchema() *v2.AdapterSchemaProto {
+	return &v2.AdapterSchemaProto{Fields: map[string]*v2.ConfigFieldProto{
+		// Required (OpenSession fails the handshake without them): no
+		// default is applied for the endpoint or the model.
+		configKeyBaseURL: {
+			Type: "string", Required: true,
+			Description: "Required. Fully-qualified base URL of the System One endpoint; the adapter appends /v1/systemone (e.g. https://s1.typesafe.ai cloud, or a local System One-compatible endpoint such as http://localhost:8080). No default is applied.",
+		},
+		configKeyModel: {
+			Type: "string", Required: true,
+			Description: "Required. The System One decision model to invoke (e.g. jev, clef, clef-flash, or a versioned model id). No default is applied.",
+		},
+		// Optional; absent means no per-call deadline — never "0s"
+		// (OpenSession rejects a zero duration), so the schema carries no
+		// default and absence IS the default.
+		configKeyTimeout: {
+			Type:        "string",
+			Description: "Optional. Per-call HTTP deadline as a positive Go duration (e.g. 45s, 2m); a present but invalid or zero value fails the session open. Absent = no per-call deadline: the call waits until the HTTP transport or the step itself fails.",
+		},
+		// Optional with the default spelled out (DEFAULTS EXPLICIT):
+		// retries default 0 — the first non-retryable error fails the step.
+		configKeyRetries: {
+			Type: "number", DefaultStr: "0",
+			Description: "Optional. Extra attempts for retryable failures (HTTP 429 and 5xx; Retry-After is honored). Default: 0 — the first error fails the step.",
+		},
+		configKeyOutcomeQuestion: {
+			Type:        "string",
+			Description: "Optional. Bareword id of the ONE choice question whose selected choice maps verbatim onto the step outcome (ADR-0013 D3). Absent or empty = no mapping: every step is outcome_pure and succeeds regardless of allowed_outcomes. The named question must appear in the step's questions with type choice, and its selected choice must be a member of the step's declared outcomes, or the step fails with the typed outcome_out_of_set payload.",
+		},
+	}}
+}
+
+// infoInputSchema is the compile-time input contract: steps may pass exactly
+// these keys, across BOTH the per-step input{} and secret_input{} blocks.
+//
+// No field is Required here even though Execute fails closed without
+// questions/state: the compiler validates secret_input{} against the same
+// schema, so a Required questions/state would falsely fail every step that
+// carries a secret binding. Requiredness is the runtime contract instead —
+// Execute fails closed before any HTTP traffic when they are absent — and
+// the descriptions say so.
+func infoInputSchema() *v2.AdapterSchemaProto {
+	return &v2.AdapterSchemaProto{Fields: map[string]*v2.ConfigFieldProto{
+		"questions": {
+			Type:        "string",
+			Description: "Required at runtime (Execute fails closed before any HTTP traffic when absent or malformed): the questions JSON array, decoded strictly. Each question object carries {id, type, instructions, criteria}: id is a bareword (ASCII letters, digits, or underscores, not starting with a digit, unique per array), instructions is a non-empty string, and criteria matches the type — choice: a non-empty {option name: description} object; score: a non-empty ordered level list (e.g. [\"low\",\"medium\",\"high\"]); noul: an optional yes/no gloss string.",
+		},
+		"state": {
+			Type:        "string",
+			Description: "Required at runtime (Execute fails closed before any HTTP traffic when absent or malformed): the state JSON — a JSON string, object, or array — decoded strictly.",
+		},
+		apiKeyName: {
+			Type: "string", Sensitive: true,
+			Description: "Optional. The System One api credential (sent as Authorization: Bearer <key>; absent = unauthenticated access). Sensitive: bind it only through secret_input (a secret-tainted value) or the adapter's secrets{} block; Execute rejects it in the plaintext input channel.",
+		},
+	}}
+}
+
+// infoOutputSchema is the compile-time output contract: steps may reference
+// exactly these keys as steps.<step>.<key> (and in outcome schema subsets).
+// answers and usage are the success payload — byte-verbatim from the backend;
+// error is the typed failure payload every routed failure class emits. None
+// of them is Required: the payload produced depends on the step outcome
+// (success carries answers+usage, failure carries error), and undeclared or
+// missing keys are tolerated by the host's typed-output decoder.
+func infoOutputSchema() *v2.AdapterSchemaProto {
+	return &v2.AdapterSchemaProto{Fields: map[string]*v2.ConfigFieldProto{
+		"answers": {
+			Type:        "array",
+			Description: "The per-question answers JSON array, byte-verbatim from the backend (present on outcome success). Entries are positionally aligned with the input questions and each answers[i] carries {id, type, ...value fields}: choice = {choice, [legend], [probabilities]}, score = {score}, noul = {noul}; every entry may carry a numeric confidence in [0, 1] for graph-side gating.",
+		},
+		"usage": {
+			Type:        "object",
+			Description: "The backend usage object, byte-verbatim as returned by the System One response envelope's usage (present on outcome success; may be empty).",
+		},
+		"error": {
+			Type:        "object",
+			Description: "The typed failure payload (present on outcome failure): {kind, status, message, retryable[, allowed]}. kind is one of http, auth, timeout, decode, transport, canceled, or outcome_out_of_set (the strict outcome_question mapping); status is the HTTP status when the failure came from an HTTP response; retryable marks whether another attempt would help; allowed lists the step's declared outcomes when kind is outcome_out_of_set.",
+		},
+	}}
+}
+
+// declaredSecrets is the secrets declaration (name → description). The wire
+// form carries no per-secret required flag — hosts resolve by name, and
+// api_key is optional by contract: absent means unauthenticated access.
+func declaredSecrets() map[string]string {
+	return map[string]string{
+		apiKeyName: "Optional bearer credential for the System One endpoint (Authorization: Bearer <key>; absent = unauthenticated access, never an open error).",
+	}
+}
+
+// Info declares the adapter identity, the compile-time config/input/output
+// contracts (ADR-0013 D2/D7), the api_key secret, and parallel safety:
+// session state is immutable after open, so concurrent Executes are safe.
 func (s *decisionService) Info(context.Context, *v2.InfoRequest) (*v2.InfoResponse, error) {
 	return &v2.InfoResponse{
 		Name:               "decision",
+		Description:        adapterDescription,
 		Version:            Version,
-		SourceUrl:          "https://github.com/brokenbots/criteria-adapter-decision",
+		SourceUrl:          infoSourceURL,
 		SdkProtocolVersion: "2",
-		Platforms:          []string{"linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"},
+		Platforms:          adapterPlatforms(),
 		Capabilities:       []string{"parallel_safe"},
-		Secrets:            map[string]string{apiKeyName: "Bearer credential for the System One endpoint (optional)"},
+		ConfigSchema:       infoConfigSchema(),
+		InputSchema:        infoInputSchema(),
+		OutputSchema:       infoOutputSchema(),
+		Secrets:            declaredSecrets(),
 	}, nil
 }
 
@@ -267,6 +389,20 @@ func (s *decisionService) Execute(ctx context.Context, request *v2.ExecuteReques
 	stateJSON, ok := input["state"]
 	if !ok {
 		return errors.New(`input must carry a "state" key containing the state JSON (see decisionclient.ParseState)`)
+	}
+	// api_key is schema-declared as an input-field name, but it may only be
+	// bound through secret_input or the adapter secrets{} block: never as a
+	// plaintext input value on the taint-visible input channel. Reject any
+	// other key — deterministically, in sorted order.
+	var unknown []string
+	for key := range input {
+		if key != "questions" && key != "state" {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return fmt.Errorf("unknown input key %q; the step input carries only %q and %q (api_key is a secret — bind it via secret_input or the adapter secrets{} block)", unknown[0], "questions", "state")
 	}
 	questions, err := decisionclient.ParseQuestions([]byte(questionsJSON))
 	if err != nil {
