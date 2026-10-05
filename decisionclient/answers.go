@@ -73,12 +73,12 @@ func DecodeAnswers(raw []byte, questions []Question) ([]Answer, error) {
 		return nil, fmt.Errorf(errPrefix+"decode answers: %w", err)
 	}
 
-	byID := make(map[string]Question, len(questions))
-	for _, q := range questions {
+	byID := make(map[string]int, len(questions))
+	for i, q := range questions {
 		if _, dup := byID[q.ID]; dup {
 			return nil, fmt.Errorf(errPrefix+"decode answers: duplicate question id %q", q.ID)
 		}
-		byID[q.ID] = q
+		byID[q.ID] = i
 	}
 
 	answers := make([]Answer, len(questions))
@@ -91,10 +91,11 @@ func DecodeAnswers(raw []byte, questions []Question) ([]Answer, error) {
 		if rawA.ID == nil {
 			return nil, fmt.Errorf(errPrefix+"answers[%d]: answer id is required", i)
 		}
-		q, ok := byID[*rawA.ID]
+		idx, ok := byID[*rawA.ID]
 		if !ok {
 			return nil, fmt.Errorf(errPrefix+"answers[%d]: answer for unknown question %q", i, *rawA.ID)
 		}
+		q := questions[idx]
 		if answered[q.ID] {
 			return nil, fmt.Errorf(errPrefix+"answers[%d]: duplicate answer for question %q", i, q.ID)
 		}
@@ -102,7 +103,7 @@ func DecodeAnswers(raw []byte, questions []Question) ([]Answer, error) {
 		if err != nil {
 			return nil, fmt.Errorf(errPrefix+"answers[%d]: %w", i, err)
 		}
-		answers[indexOfQuestionID(questions, q.ID)] = a
+		answers[idx] = a
 		answered[q.ID] = true
 	}
 	for _, q := range questions {
@@ -111,16 +112,6 @@ func DecodeAnswers(raw []byte, questions []Question) ([]Answer, error) {
 		}
 	}
 	return answers, nil
-}
-
-// indexOfQuestionID returns the position of id in questions (-1 if absent).
-func indexOfQuestionID(questions []Question, id string) int {
-	for i, q := range questions {
-		if q.ID == id {
-			return i
-		}
-	}
-	return -1
 }
 
 // checkRawAnswer validates the decoded answer against its question and
@@ -138,7 +129,7 @@ func checkRawAnswer(raw *rawAnswer, q Question) (Answer, error) {
 			return Answer{}, err
 		}
 		if raw.Choice == nil || *raw.Choice == "" {
-			return Answer{}, fmt.Errorf("choice answer must carry a non-empty %q field", "choice")
+			return Answer{}, errors.New(`choice answer must carry a non-empty "choice" field`)
 		}
 		if _, ok := q.Options[*raw.Choice]; !ok {
 			return Answer{}, fmt.Errorf("choice answer selected %q, which is not one of the question's options", *raw.Choice)
@@ -153,13 +144,13 @@ func checkRawAnswer(raw *rawAnswer, q Question) (Answer, error) {
 			return Answer{}, err
 		}
 		if raw.Score == nil {
-			return Answer{}, fmt.Errorf("score answer must carry a %q field", "score")
+			return Answer{}, errors.New(`score answer must carry a "score" field`)
 		}
 		if *raw.Score < 0 || *raw.Score >= len(q.Levels) {
 			return Answer{}, fmt.Errorf("score %d is outside the question's %d levels", *raw.Score, len(q.Levels))
 		}
 		if raw.Legend == nil || *raw.Legend == "" {
-			return Answer{}, fmt.Errorf("score answer must carry a non-empty %q field", "legend")
+			return Answer{}, errors.New(`score answer must carry a non-empty "legend" field`)
 		}
 		if *raw.Legend != q.Levels[*raw.Score] {
 			return Answer{}, fmt.Errorf("score answer legend %q does not match level %d (%q)", *raw.Legend, *raw.Score, q.Levels[*raw.Score])
@@ -172,7 +163,7 @@ func checkRawAnswer(raw *rawAnswer, q Question) (Answer, error) {
 			return Answer{}, err
 		}
 		if raw.Noul == nil {
-			return Answer{}, fmt.Errorf("noul answer must carry a %q field", "noul")
+			return Answer{}, errors.New(`noul answer must carry a "noul" field`)
 		}
 		if *raw.Noul != "yes" && *raw.Noul != "no" {
 			return Answer{}, fmt.Errorf("noul answer must be exactly %q or %q; got %q", "yes", "no", *raw.Noul)
@@ -224,7 +215,7 @@ func requireAbsent(raw *rawAnswer, q Question, fields ...string) error {
 // checkConfidence validates the required confidence value in [0, 1].
 func checkConfidence(raw *float64, q Question) (float64, error) {
 	if raw == nil {
-		return 0, fmt.Errorf("%s answer must carry a %q field", q.Type, "confidence")
+		return 0, fmt.Errorf("%s answer must carry a \"confidence\" field", q.Type)
 	}
 	if !unitRange(*raw) {
 		return 0, fmt.Errorf("confidence %v is outside [0, 1]", *raw)
@@ -237,7 +228,7 @@ func checkConfidence(raw *float64, q Question) (float64, error) {
 // value must be in [0, 1].
 func checkProbabilities(raw *map[string]float64, q Question) (map[string]float64, error) {
 	if raw == nil {
-		return nil, fmt.Errorf("%s answer must carry a %q field", q.Type, "probabilities")
+		return nil, fmt.Errorf("%s answer must carry a \"probabilities\" field", q.Type)
 	}
 	if len(*raw) == 0 {
 		return nil, errors.New("probabilities must be non-empty")
