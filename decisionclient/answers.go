@@ -72,7 +72,14 @@ func DecodeAnswers(raw []byte, questions []Question) ([]Answer, error) {
 	if err := strictUnmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf(errPrefix+"decode answers: %w", err)
 	}
+	return decodeAnswerEntries(env.Answers, questions)
+}
 
+// decodeAnswerEntries maps raw answer objects onto the validated questions,
+// aligned to question order with exact coverage. It is the shared mapping
+// core of [DecodeAnswers] (answers-only envelope) and [DecodeDecisionResponse]
+// (full {model, answers, usage} response envelope).
+func decodeAnswerEntries(entries []json.RawMessage, questions []Question) ([]Answer, error) {
 	byID := make(map[string]int, len(questions))
 	for i, q := range questions {
 		if _, dup := byID[q.ID]; dup {
@@ -83,7 +90,7 @@ func DecodeAnswers(raw []byte, questions []Question) ([]Answer, error) {
 
 	answers := make([]Answer, len(questions))
 	answered := make(map[string]bool, len(questions))
-	for i, r := range env.Answers {
+	for i, r := range entries {
 		var rawA rawAnswer
 		if err := strictUnmarshal(r, &rawA); err != nil {
 			return nil, fmt.Errorf(errPrefix+"answers[%d]: decode answer: %w", i, err)
