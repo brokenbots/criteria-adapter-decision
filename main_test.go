@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,6 +91,12 @@ type stubExchange struct {
 // sticky (replayed for every further request). The returned counter records
 // every request seen.
 func stubBackend(t *testing.T, exchanges ...stubExchange) (*decisionService, *int32) {
+	return stubBackendWithConfig(t, nil, exchanges...)
+}
+
+// stubBackendWithConfig is stubBackend with the session opened carrying the
+// given extra config keys (e.g. the outcome_question mapping key).
+func stubBackendWithConfig(t *testing.T, extraConfig map[string]string, exchanges ...stubExchange) (*decisionService, *int32) {
 	t.Helper()
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +118,7 @@ func stubBackend(t *testing.T, exchanges ...stubExchange) (*decisionService, *in
 	}))
 	t.Cleanup(srv.Close)
 	s := newTestService()
-	openDecisionSession(t, s, srv.URL, nil, nil)
+	openDecisionSession(t, s, srv.URL, extraConfig, nil)
 	return s, &calls
 }
 
@@ -170,7 +177,13 @@ func callExecute(t *testing.T, s *decisionService, input, secretInputs map[strin
 
 // validInput builds the minimal valid input with the given state JSON.
 func validInput(state string) map[string]string {
-	return map[string]string{"questions": executeValidQuestionsJSON, "state": state}
+	return validInputWithQuestions(executeValidQuestionsJSON, state)
+}
+
+// validInputWithQuestions builds a valid Execute input from the given
+// questions and state JSON.
+func validInputWithQuestions(questions, state string) map[string]string {
+	return map[string]string{"questions": questions, "state": state}
 }
 
 // TestExecuteInputRequired pins that the questions and state input keys are
@@ -678,6 +691,9 @@ func TestOpenSessionValidationMatrix(t *testing.T) {
 		{name: "unknown secret", config: map[string]string{configKeyBaseURL: "http://x", configKeyModel: "m"}, secrets: map[string]string{"github_token": "ghp-x"}, wantErr: `unknown secret "github_token"`},
 		{name: "bad allowed outcome", config: map[string]string{configKeyBaseURL: "http://x", configKeyModel: "m"}, allowed: []string{outcomeSuccess, "continue"}, wantErr: `unknown outcome "continue"`},
 		{name: "duplicate allowed outcome", config: map[string]string{configKeyBaseURL: "http://x", configKeyModel: "m"}, allowed: []string{outcomeSuccess, outcomeSuccess}, wantErr: `duplicate outcome "success"`},
+		{name: "non-bareword outcome_question", config: map[string]string{configKeyBaseURL: "http://x", configKeyModel: "m", configKeyOutcomeQuestion: "does-run-pass"}, wantErr: "config outcome_question must be a bareword question id"},
+		{name: "outcome_question naming a bareword id is valid", config: map[string]string{configKeyBaseURL: "http://x", configKeyModel: "m", configKeyOutcomeQuestion: "route"}, valid: true},
+		{name: "empty outcome_question means absent (outcome_pure)", config: map[string]string{configKeyBaseURL: "http://x", configKeyModel: "m", configKeyOutcomeQuestion: ""}, valid: true},
 		{name: "no secrets and no allowed outcomes is valid", config: map[string]string{configKeyBaseURL: "http://x", configKeyModel: "m"}, valid: true},
 	}
 	for _, tc := range tests {
@@ -864,5 +880,260 @@ func TestLogReturnsPromptly(t *testing.T) {
 	}
 	if len(sender.events) != 0 {
 		t.Errorf("Log emitted %d events, want 0 (the SDK owns heartbeats)", len(sender.events))
+	}
+}
+
+// --- outcome_question mapping (ADR-0013 D3, Kanboard 203) --------------------
+
+// mappingQuestionsJSON is a valid choice+noul question pair for the
+// outcome_question mapping tests: "route" is the choice question the mapping
+// reads, and its options deliberately include "abort" — a name that is NOT an
+// adapter outcome — so an answer that decodes cleanly can still be
+// out-of-set for the mapping.
+const mappingQuestionsJSON = `[{"id":"route","type":"choice","instructions":"Route the run.","criteria":{"success":"take the success branch","failure":"take the failure branch","abort":"abandon the run"}},{"id":"verdict","type":"noul","instructions":"Is the run safe?"}]`
+
+// mappingAnswer returns the verbatim answers array for mappingQuestionsJSON
+// with the given choice selected for "route".
+func mappingAnswer(choice string) string {
+	return fmt.Sprintf(`[{"id":"route","choice":%q,"probabilities":{"abort":0.1,"failure":0.2,"success":0.7},"confidence":0.9},{"id":"verdict","noul":"yes"}]`, choice)
+}
+
+// mappingResponse returns the full success response body with the given
+// choice selected for the mapping question.
+func mappingResponse(choice string) string {
+	return `{"model":"sysone-1","answers":` + mappingAnswer(choice) + `,"usage":` + usageVerbatim + `}`
+}
+
+// mappingFailurePayloadOf is the typed payload of the mapping's routed
+// failure; failurePayloadOf cannot carry the extra "allowed" member.
+type mappingFailurePayloadOf struct {
+	Error struct {
+		Kind      string   `json:"kind"`
+		Status    int      `json:"status"`
+		Message   string   `json:"message"`
+		Retryable bool     `json:"retryable"`
+		Allowed   []string `json:"allowed"`
+	} `json:"error"`
+}
+
+// TestExecuteOutcomeMappingHappyPath pins the strict set-member contract:
+// on a mapped step the selected choice maps VERBATIM onto the step outcome
+// (both members), the outputs stay byte-verbatim answers+usage on both
+// mapped outcomes (a failure-mapped outcome invents no error payload), and
+// the call still emits decision.completed — the mapping changes the outcome
+// name, not the event posture.
+func TestExecuteOutcomeMappingHappyPath(t *testing.T) {
+	tests := []struct {
+		name        string
+		choice      string
+		allowed     []string
+		wantOutcome string
+	}{
+		{name: "choice success maps onto outcome success", choice: "success", allowed: []string{outcomeSuccess, outcomeFailure}, wantOutcome: outcomeSuccess},
+		{name: "choice failure maps onto outcome failure", choice: "failure", allowed: []string{outcomeSuccess, outcomeFailure}, wantOutcome: outcomeFailure},
+		{name: "empty step allowed_outcomes means the full vocabulary", choice: "failure", allowed: nil, wantOutcome: outcomeFailure},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, calls := stubBackendWithConfig(t, map[string]string{configKeyOutcomeQuestion: "route"}, stubExchange{body: mappingResponse(tc.choice)})
+			sink, err := callExecute(t, s, validInputWithQuestions(mappingQuestionsJSON, `"ready"`), nil, tc.allowed)
+			if err != nil {
+				t.Fatalf("Execute: %v (in-set mapping is a routed success/failure, never an engine error)", err)
+			}
+			adapter, result := captureRun(t, sink, 1)
+			if result.GetOutcome() != tc.wantOutcome {
+				t.Errorf("outcome = %q; want the verbatim choice %q", result.GetOutcome(), tc.wantOutcome)
+			}
+			wantOutputs := `{"answers":` + mappingAnswer(tc.choice) + `,"usage":` + usageVerbatim + `}`
+			if got := string(result.GetOutputsJson()); got != wantOutputs {
+				t.Errorf("outputs =\n%s\nwant byte-verbatim (answers+usage, unchanged by the mapping)\n%s", got, wantOutputs)
+			}
+			if adapter.GetEventKind() != eventDecisionCompleted {
+				t.Errorf("adapter event kind = %q; want %q even for a failure-mapped outcome", adapter.GetEventKind(), eventDecisionCompleted)
+			}
+			if got := atomic.LoadInt32(calls); got != 1 {
+				t.Errorf("backend saw %d requests; want 1", got)
+			}
+		})
+	}
+}
+
+// TestExecuteOutcomeMappingOutOfSet pins the fail-closed membership rule:
+// a selected choice that is not a member of the step's allowed_outcomes set
+// routes onto outcome "failure" with the typed payload
+// {error: {kind: "outcome_out_of_set", allowed: [...], message,
+// status, retryable}} — never an engine-visible error, never the choice
+// passing through as an outcome.
+func TestExecuteOutcomeMappingOutOfSet(t *testing.T) {
+	tests := []struct {
+		name        string
+		choice      string
+		allowed     []string
+		wantAllowed []string
+	}{
+		{name: "a valid question option that names no outcome", choice: "abort", allowed: []string{outcomeSuccess, outcomeFailure}, wantAllowed: []string{outcomeSuccess, outcomeFailure}},
+		{name: "an in-vocabulary choice outside the step narrowing", choice: "success", allowed: []string{outcomeFailure}, wantAllowed: []string{outcomeFailure}},
+		{name: "empty step narrowing expands to the full vocabulary", choice: "abort", allowed: nil, wantAllowed: []string{outcomeSuccess, outcomeFailure}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := stubBackendWithConfig(t, map[string]string{configKeyOutcomeQuestion: "route"}, stubExchange{body: mappingResponse(tc.choice)})
+			sink, err := callExecute(t, s, validInputWithQuestions(mappingQuestionsJSON, `"ready"`), nil, tc.allowed)
+			if err != nil {
+				t.Fatalf("Execute: %v (out-of-set is a routed failure, not an engine error)", err)
+			}
+			adapter, result := captureRun(t, sink, 1)
+			if result.GetOutcome() != outcomeFailure {
+				t.Errorf("outcome = %q; want %q (fail closed)", result.GetOutcome(), outcomeFailure)
+			}
+			var payload mappingFailurePayloadOf
+			if err := json.Unmarshal(result.GetOutputsJson(), &payload); err != nil {
+				t.Fatalf("failure payload: %v", err)
+			}
+			if payload.Error.Kind != outcomeOutOfSetKind {
+				t.Errorf("error.kind = %q; want %q", payload.Error.Kind, outcomeOutOfSetKind)
+			}
+			if payload.Error.Status != 0 || payload.Error.Retryable {
+				t.Errorf("error.status = %d, error.retryable = %v; want 0/false (a mapping contract breach is deterministic)", payload.Error.Status, payload.Error.Retryable)
+			}
+			if !slices.Equal(payload.Error.Allowed, tc.wantAllowed) {
+				t.Errorf("error.allowed = %v; want %v", payload.Error.Allowed, tc.wantAllowed)
+			}
+			if !strings.Contains(payload.Error.Message, `"route"`) || !strings.Contains(payload.Error.Message, tc.choice) {
+				t.Errorf("error.message = %q; want it to name the question and the rejected choice", payload.Error.Message)
+			}
+			if adapter.GetEventKind() != eventDecisionFailed {
+				t.Errorf("adapter event kind = %q; want %q", adapter.GetEventKind(), eventDecisionFailed)
+			}
+			eventError, ok := adapter.GetPayload().AsMap()["error"].(map[string]any)
+			if !ok {
+				t.Fatalf("event payload = %#v; want an error object", adapter.GetPayload().AsMap())
+			}
+			eventAllowed := []string{}
+			for _, name := range eventError["allowed"].([]any) {
+				eventAllowed = append(eventAllowed, name.(string))
+			}
+			if !slices.Equal(eventAllowed, tc.wantAllowed) {
+				t.Errorf("event error.allowed = %v; want %v (event and result carry the same typed payload)", eventAllowed, tc.wantAllowed)
+			}
+		})
+	}
+}
+
+// TestExecuteOutcomeMappingConfigErrors pins the phase-1 config checks at
+// Execute (questions are per-step inputs, never on the session's contract):
+// a step carrying the configured id with a type that cannot produce a
+// choice fails closed — an engine-visible config error, BEFORE any HTTP
+// traffic and without emitting any event.
+func TestExecuteOutcomeMappingConfigErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		questions string
+		wantErr   string
+	}{
+		{name: "mapped id carried as noul", questions: `[{"id":"route","type":"noul","instructions":"Route the run?"}]`, wantErr: `config outcome_question names question "route" with type "noul"; the strict Choice-to-outcome mapping requires type "choice"`},
+		{name: "mapped id carried as score", questions: `[{"id":"route","type":"score","instructions":"Route the run.","criteria":["low","high"]}]`, wantErr: `config outcome_question names question "route" with type "score"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, calls := stubBackendWithConfig(t, map[string]string{configKeyOutcomeQuestion: "route"}, stubExchange{body: mappingResponse("success")})
+			sink, err := callExecute(t, s, validInputWithQuestions(tc.questions, `"ready"`), nil, nil)
+			if err == nil {
+				t.Fatalf("Execute(...) err = nil; want the config error %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Execute(...) err = %q; want containing %q", err.Error(), tc.wantErr)
+			}
+			if got := len(sink.events); got != 0 {
+				t.Fatalf("Execute emitted %d events; want 0 (config errors are not routed)", got)
+			}
+			if got := atomic.LoadInt32(calls); got != 0 {
+				t.Fatalf("backend saw %d requests; want 0 (fail closed before any HTTP traffic)", got)
+			}
+		})
+	}
+}
+
+// TestExecuteOutcomeMappingMixedUsage pins mixed usage (workstream step 4):
+// ONE opened session whose config names the outcome question, serving steps
+// with and without it. A step whose questions lack the configured id is an
+// outcome_pure step — ALWAYS outcome success regardless of the step's
+// allowed_outcomes — while a step carrying the id maps strictly. This is
+// also where the default-absent posture (no outcome_question configured)
+// pins outcome_pure success despite a narrowed step set.
+func TestExecuteOutcomeMappingMixedUsage(t *testing.T) {
+	s, calls := stubBackendWithConfig(t,
+		map[string]string{configKeyOutcomeQuestion: "route"},
+		stubExchange{body: successResponse()},          // step without the question
+		stubExchange{body: mappingResponse("success")}, // mapped step
+	)
+
+	// Step 1: the outcome question is absent from the step's questions —
+	// not a config error; the step stays outcome_pure and always succeeds,
+	// even with a narrowing that does not declare success.
+	sink, err := callExecute(t, s, validInput(`"ready"`), nil, []string{outcomeFailure})
+	if err != nil {
+		t.Fatalf("Execute (step without the question): %v", err)
+	}
+	adapter, result := captureRun(t, sink, 1)
+	if result.GetOutcome() != outcomeSuccess {
+		t.Errorf("outcome_pure step outcome = %q; want %q regardless of allowed_outcomes", result.GetOutcome(), outcomeSuccess)
+	}
+	if adapter.GetEventKind() != eventDecisionCompleted {
+		t.Errorf("outcome_pure step event kind = %q; want %q", adapter.GetEventKind(), eventDecisionCompleted)
+	}
+
+	// Step 2: the outcome question rides the step's questions and maps
+	// strictly.
+	sink, err = callExecute(t, s, validInputWithQuestions(mappingQuestionsJSON, `"ready"`), nil, []string{outcomeSuccess, outcomeFailure})
+	if err != nil {
+		t.Fatalf("Execute (mapped step): %v", err)
+	}
+	_, result = captureRun(t, sink, 1)
+	if result.GetOutcome() != outcomeSuccess {
+		t.Errorf("mapped step outcome = %q; want the verbatim choice %q", result.GetOutcome(), outcomeSuccess)
+	}
+	if got := atomic.LoadInt32(calls); got != 2 {
+		t.Errorf("backend saw %d requests; want 2 (one per step)", got)
+	}
+}
+
+// TestExecuteOutcomePureIgnoresAllowedOutcomes pins the default posture over
+// a narrowed step set: with no outcome_question configured, the outcome is
+// ALWAYS success regardless of allowed_outcomes (routing is graph-side).
+func TestExecuteOutcomePureIgnoresAllowedOutcomes(t *testing.T) {
+	s, _ := stubBackend(t, stubExchange{body: successResponse()})
+	sink, err := callExecute(t, s, validInput(`"ready"`), nil, []string{outcomeFailure})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	_, result := captureRun(t, sink, 1)
+	if result.GetOutcome() != outcomeSuccess {
+		t.Errorf("outcome = %q; want %q regardless of allowed_outcomes", result.GetOutcome(), outcomeSuccess)
+	}
+}
+
+// TestExecuteOutcomeMappingKeepsDecisionFailures pins that the mapping never
+// hijacks a failing backend call: on a mapped step a 5xx decision still
+// routes the D6 http-kind failure payload, not the out-of-set one.
+func TestExecuteOutcomeMappingKeepsDecisionFailures(t *testing.T) {
+	s, _ := stubBackendWithConfig(t,
+		map[string]string{configKeyOutcomeQuestion: "route"},
+		stubExchange{status: http.StatusInternalServerError, body: "boom"},
+	)
+	sink, err := callExecute(t, s, validInputWithQuestions(mappingQuestionsJSON, `"ready"`), nil, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	_, result := captureRun(t, sink, 1)
+	if result.GetOutcome() != outcomeFailure {
+		t.Errorf("outcome = %q; want %q", result.GetOutcome(), outcomeFailure)
+	}
+	var payload failurePayloadOf
+	if err := json.Unmarshal(result.GetOutputsJson(), &payload); err != nil {
+		t.Fatalf("failure payload: %v", err)
+	}
+	if payload.Error.Kind != decisionclient.DecisionErrorKindHTTP || payload.Error.Status != http.StatusInternalServerError {
+		t.Errorf("failure payload kind = %q status = %d; want http/500 (D6 routing is untouched by the mapping)", payload.Error.Kind, payload.Error.Status)
 	}
 }

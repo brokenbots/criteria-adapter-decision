@@ -440,12 +440,19 @@ func executeFailure(sess *decisionSession, request *v2.ExecuteRequest, sink adap
 // graph-side contract, and what to do about an out-of-set choice routes
 // graph-side).
 func executeMappingFailure(sess *decisionSession, request *v2.ExecuteRequest, sink adapterhost.ExecuteEventSender, questionID, choice string, allowed []string, latencyMS int64) error {
+	// The payload feeds BOTH the proto adapter_event (structpb only accepts
+	// []any of primitives) and the JSON result, so the allowed list must be
+	// []any — a []string would fall out of the event as an _encode_error.
+	allowedAny := make([]any, len(allowed))
+	for i, name := range allowed {
+		allowedAny[i] = name
+	}
 	return routeFailure(sess, request, sink, map[string]any{
 		"kind":      outcomeOutOfSetKind,
 		"status":    0,
 		"message":   redactSecrets(fmt.Sprintf("answer for question %q selected choice %q, which is not one of the step's allowed outcomes %v", questionID, choice, allowed), redactionValues(sess, request)),
 		"retryable": false,
-		"allowed":   allowed,
+		"allowed":   allowedAny,
 	}, latencyMS)
 }
 
