@@ -2,6 +2,7 @@ package decisionclient
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -55,6 +56,51 @@ func newTestClient(t *testing.T, serverURL, model string, apiKey ...string) *Sys
 	return c
 }
 
+// TestDecisionValidatesBeforeHTTP proves the reject list fails the call
+// without any HTTP traffic: the stub recorder stays empty for every
+// invalid request.
+func TestDecisionValidatesBeforeHTTP(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		state   State
+		input   []Question
+		wantErr string
+	}{
+		{name: "bad question type", state: "ready", input: []Question{{ID: "q1", Type: QuestionType("emoji"), Instructions: "Decide."}}, wantErr: "type must be"},
+		{name: "empty instructions", state: "ready", input: []Question{{ID: "q1", Type: TypeNoul, Instructions: ""}}, wantErr: "instructions is required"},
+		{name: "choice without criteria", state: "ready", input: []Question{{ID: "q1", Type: TypeChoice, Instructions: "Pick."}}, wantErr: "choice question"},
+		{name: "score criteria wrong shape", state: "ready", input: []Question{{ID: "q1", Type: TypeScore, Instructions: "Grade.", Levels: []string{}}}, wantErr: "score question"},
+		{name: "non-bareword id", state: "ready", input: []Question{{ID: "does-run-pass", Type: TypeNoul, Instructions: "Decide."}}, wantErr: "bareword"},
+		{name: "cross-type criteria", state: "ready", input: []Question{{ID: "q1", Type: TypeChoice, Instructions: "Pick.", Levels: []string{"low", "high"}}}, wantErr: "must not carry score criteria"},
+		{name: "duplicate question ids", state: "ready", input: []Question{{ID: "q1", Type: TypeNoul, Instructions: "One."}, {ID: "q1", Type: TypeNoul, Instructions: "Two."}}, wantErr: "duplicate question id"},
+		{name: "no questions", state: "ready", input: nil, wantErr: "at least one question"},
+		{name: "nil state", state: nil, input: testQuestions(), wantErr: "state must be a JSON string, object, or array"},
+		{name: "number state", state: json.Number("3"), input: testQuestions(), wantErr: "state must be a JSON string, object, or array"},
+		{name: "boolean state", state: true, input: testQuestions(), wantErr: "state must be a JSON string, object, or array"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			stub := newDecisionStub(t, "{}")
+			client := newTestClient(t, stub.server.URL, "clef")
+
+			_, err := client.Decision(context.Background(), tc.state, tc.input)
+			if err == nil {
+				t.Fatalf("Decision() err = nil; want containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Decision() err = %q; want containing %q", err.Error(), tc.wantErr)
+			}
+			if stub.recorder.Request != nil {
+				t.Fatalf("Decision() hit the backend for an invalid request; want validation before any HTTP traffic")
+			}
+		})
+	}
+}
+
 func TestNewRejectsInvalidConfiguration(t *testing.T) {
 	t.Parallel()
 
@@ -87,12 +133,23 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
+// testQuestions returns a minimal valid question set for stub-based tests.
+func testQuestions() []Question {
+	return []Question{
+		{ID: "verdict", Type: TypeNoul, Instructions: "Say whether the run is acceptable."},
+	}
+}
+
 func TestDecisionWireShape(t *testing.T) {
 	t.Parallel()
 
 	stub := newDecisionStub(t, "{}")
 	client := newTestClient(t, stub.server.URL, "m1")
-	questions := []string{"Does the run pass?", "Is it safe?"}
+	questions := []Question{
+		{ID: "does_run_pass", Type: TypeChoice, Instructions: "Pick the run outcome.", Options: map[string]string{"pass": "The run passed.", "fail": "The run failed."}},
+		{ID: "quality", Type: TypeScore, Instructions: "Grade the run quality.", Levels: []string{"low", "high"}},
+		{ID: "safe", Type: TypeNoul, Instructions: "Is the run safe?"},
+	}
 
 	raw, err := client.Decision(context.Background(), "ready", questions)
 	if err != nil {
@@ -118,7 +175,10 @@ func TestDecisionWireShape(t *testing.T) {
 	if got := rec.Request.Header.Get("Accept"); got != "application/json" {
 		t.Fatalf("Accept = %q; want application/json", got)
 	}
-	wantBody := `{"model":"m1","state":"ready","questions":["Does the run pass?","Is it safe?"]}`
+	wantBody := `{"model":"m1","state":"ready","questions":[` +
+		`{"id":"does_run_pass","type":"choice","instructions":"Pick the run outcome.","criteria":{"fail":"The run failed.","pass":"The run passed."}},` +
+		`{"id":"quality","type":"score","instructions":"Grade the run quality.","criteria":["low","high"]},` +
+		`{"id":"safe","type":"noul","instructions":"Is the run safe?"}]}`
 	if string(rec.Body) != wantBody {
 		t.Fatalf("request body = %s; want %s", rec.Body, wantBody)
 	}
@@ -143,7 +203,7 @@ func TestDecisionRequestPathFromBaseURL(t *testing.T) {
 			t.Parallel()
 			stub := newDecisionStub(t, "{}")
 			client := newTestClient(t, stub.server.URL+tc.basePath, "clef")
-			if _, err := client.Decision(context.Background(), "ready", nil); err != nil {
+			if _, err := client.Decision(context.Background(), "ready", testQuestions()); err != nil {
 				t.Fatalf("Decision() err = %v; want nil", err)
 			}
 			if got := stub.recorder.Request.URL.Path; got != tc.wantPath {
@@ -171,7 +231,7 @@ func TestDecisionAuthHeaderOnlyWithKey(t *testing.T) {
 			t.Parallel()
 			stub := newDecisionStub(t, "{}")
 			client := newTestClient(t, stub.server.URL, "clef", tc.apiKey...)
-			if _, err := client.Decision(context.Background(), "ready", nil); err != nil {
+			if _, err := client.Decision(context.Background(), "ready", testQuestions()); err != nil {
 				t.Fatalf("Decision() err = %v; want nil", err)
 			}
 			got := stub.recorder.Request.Header.Get("Authorization")
@@ -191,7 +251,7 @@ func TestDecisionPassthroughByteIdentical(t *testing.T) {
 	stub := newDecisionStub(t, backendBody)
 	client := newTestClient(t, stub.server.URL, "clef")
 
-	raw, err := client.Decision(context.Background(), "ready", []string{"q"})
+	raw, err := client.Decision(context.Background(), "ready", testQuestions())
 	if err != nil {
 		t.Fatalf("Decision() err = %v; want nil", err)
 	}
@@ -224,7 +284,7 @@ func TestDecisionErrorsOnServerStatus(t *testing.T) {
 			t.Cleanup(server.Close)
 
 			client := newTestClient(t, server.URL, "clef")
-			_, err := client.Decision(context.Background(), "ready", nil)
+			_, err := client.Decision(context.Background(), "ready", testQuestions())
 			if err == nil {
 				t.Fatalf("Decision() err = nil; want status %d error", tc.status)
 			}
@@ -242,7 +302,7 @@ func TestDecisionRejectsInvalidJSONResponse(t *testing.T) {
 
 	stub := newDecisionStub(t, `{"state": unquoted`)
 	client := newTestClient(t, stub.server.URL, "clef")
-	_, err := client.Decision(context.Background(), "ready", nil)
+	_, err := client.Decision(context.Background(), "ready", testQuestions())
 	if err == nil {
 		t.Fatal("Decision() err = nil; want invalid-JSON error")
 	}
@@ -251,18 +311,21 @@ func TestDecisionRejectsInvalidJSONResponse(t *testing.T) {
 	}
 }
 
-func TestDecisionQuestionsWireVariants(t *testing.T) {
+func TestDecisionStateWireVariants(t *testing.T) {
 	t.Parallel()
 
+	stateQuestions := []Question{{ID: "q1", Type: TypeNoul, Instructions: "Decide."}}
 	tests := []struct {
 		name     string
-		input    []string
+		input    State
 		wantBody string
 	}{
-		{name: "nil questions", input: nil, wantBody: `{"model":"clef","state":"ready","questions":[]}`},
-		{name: "empty questions", input: []string{}, wantBody: `{"model":"clef","state":"ready","questions":[]}`},
-		{name: "one question", input: []string{"q1"}, wantBody: `{"model":"clef","state":"ready","questions":["q1"]}`},
-		{name: "question order preserved", input: []string{"b", "a"}, wantBody: `{"model":"clef","state":"ready","questions":["b","a"]}`},
+		{name: "string state", input: "ready", wantBody: `{"model":"clef","state":"ready","questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
+		{name: "object state", input: map[string]any{"branch": "main", "reps": json.Number("3")}, wantBody: `{"model":"clef","state":{"branch":"main","reps":3},"questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
+		{name: "array state", input: []any{"a", json.Number("0.5")}, wantBody: `{"model":"clef","state":["a",0.5],"questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
+		{name: "empty object state", input: map[string]any{}, wantBody: `{"model":"clef","state":{},"questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
+		{name: "empty array state", input: []any{}, wantBody: `{"model":"clef","state":[],"questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
+		{name: "empty string state", input: "", wantBody: `{"model":"clef","state":"","questions":[{"id":"q1","type":"noul","instructions":"Decide."}]}`},
 	}
 
 	for _, tc := range tests {
@@ -270,13 +333,35 @@ func TestDecisionQuestionsWireVariants(t *testing.T) {
 			t.Parallel()
 			stub := newDecisionStub(t, "{}")
 			client := newTestClient(t, stub.server.URL, "clef")
-			if _, err := client.Decision(context.Background(), "ready", tc.input); err != nil {
+			if _, err := client.Decision(context.Background(), tc.input, stateQuestions); err != nil {
 				t.Fatalf("Decision() err = %v; want nil", err)
 			}
 			if string(stub.recorder.Body) != tc.wantBody {
 				t.Fatalf("request body = %s; want %s", stub.recorder.Body, tc.wantBody)
 			}
 		})
+	}
+}
+
+// TestDecisionQuestionOrderPreserved pins the questions array to the exact
+// wire order given by the caller.
+func TestDecisionQuestionOrderPreserved(t *testing.T) {
+	t.Parallel()
+
+	stub := newDecisionStub(t, "{}")
+	client := newTestClient(t, stub.server.URL, "clef")
+	questions := []Question{
+		{ID: "b_second", Type: TypeNoul, Instructions: "Second."},
+		{ID: "a_first", Type: TypeNoul, Instructions: "First."},
+	}
+	if _, err := client.Decision(context.Background(), "ready", questions); err != nil {
+		t.Fatalf("Decision() err = %v; want nil", err)
+	}
+	wantBody := `{"model":"clef","state":"ready","questions":[` +
+		`{"id":"b_second","type":"noul","instructions":"Second."},` +
+		`{"id":"a_first","type":"noul","instructions":"First."}]}`
+	if string(stub.recorder.Body) != wantBody {
+		t.Fatalf("request body = %s; want %s", stub.recorder.Body, wantBody)
 	}
 }
 
@@ -287,7 +372,7 @@ func TestDecisionCanceledContext(t *testing.T) {
 	cancel()
 	stub := newDecisionStub(t, "{}")
 	client := newTestClient(t, stub.server.URL, "clef")
-	_, err := client.Decision(ctx, "ready", nil)
+	_, err := client.Decision(ctx, "ready", testQuestions())
 	if err == nil {
 		t.Fatal("Decision() err = nil with canceled context; want context error")
 	}
@@ -301,7 +386,7 @@ func TestDecisionNilContext(t *testing.T) {
 
 	stub := newDecisionStub(t, "{}")
 	client := newTestClient(t, stub.server.URL, "clef")
-	if _, err := client.Decision(nil, "ready", nil); err == nil {
+	if _, err := client.Decision(nil, "ready", testQuestions()); err == nil {
 		t.Fatal("Decision(nil ctx) err = nil; want error")
 	}
 }
@@ -318,7 +403,7 @@ func TestDecisionRejectsOversizedResponse(t *testing.T) {
 		t.Cleanup(server.Close)
 
 		client := newTestClient(t, server.URL, "clef")
-		raw, err := client.Decision(context.Background(), "ready", nil)
+		raw, err := client.Decision(context.Background(), "ready", testQuestions())
 		if err != nil {
 			t.Fatalf("Decision() err = %v; want nil", err)
 		}
@@ -336,7 +421,7 @@ func TestDecisionRejectsOversizedResponse(t *testing.T) {
 		t.Cleanup(server.Close)
 
 		client := newTestClient(t, server.URL, "clef")
-		_, err := client.Decision(context.Background(), "ready", nil)
+		_, err := client.Decision(context.Background(), "ready", testQuestions())
 		if err == nil {
 			t.Fatal("Decision() err = nil; want oversized-response error")
 		}
@@ -359,7 +444,7 @@ func TestDecisionSafeForConcurrentUse(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			raw, err := client.Decision(context.Background(), "ready", []string{"q"})
+			raw, err := client.Decision(context.Background(), "ready", testQuestions())
 			if err != nil {
 				errs <- err
 				return

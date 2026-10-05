@@ -8,8 +8,11 @@
 // applies defaults for base_url or model (an unset value is an error, never a
 // package-level default), it draws no distinction between backend types, and
 // it sends the same {model, state, questions} request wire shape to every
-// System One endpoint. Deadlines and cancellation come from the caller's
-// context; the client imposes no timeout of its own.
+// System One endpoint. Requests are validated fail-closed before any HTTP
+// traffic (strict question/state contract, no unknown keys), and answers
+// decode losslessly onto typed [Question]/[Answer] values — every decode
+// defect is an error, never a silent drop. Deadlines and cancellation come
+// from the caller's context; the client imposes no timeout of its own.
 package decisionclient
 
 import (
@@ -43,9 +46,9 @@ const maxErrorBodyBytes = 512
 // systemOneRequest is the System One request wire shape. Field order is the
 // wire order (encoding/json marshals struct fields in declaration order).
 type systemOneRequest struct {
-	Model     string   `json:"model"`
-	State     string   `json:"state"`
-	Questions []string `json:"questions"`
+	Model     string     `json:"model"`
+	State     State      `json:"state"`
+	Questions []Question `json:"questions"`
 }
 
 // SystemOneClient calls a System One decision-model backend. All fields are
@@ -120,23 +123,28 @@ func New(baseURL, model string, apiKey ...string) (*SystemOneClient, error) {
 
 // Decision posts the decision request for state and questions to the backend
 // and returns its raw JSON response body verbatim — no decoding, no
-// re-encoding, byte-identical to what the backend sent.
+// re-encoding, byte-identical to what the backend sent. Decode the response
+// with [DecodeAnswers] against the same questions.
 //
-// The request carries exactly {model, state, questions}: the configured model,
-// the state, and the questions in the order given (a nil or empty question
-// list is sent as an empty JSON array).
-func (c *SystemOneClient) Decision(ctx context.Context, state string, questions []string) (json.RawMessage, error) {
+// The request is validated FAIL-CLOSED before any HTTP traffic: the state
+// must be a JSON string, object, or array, and every question must pass the
+// strict questions contract (bareword id, known type, non-empty
+// instructions, criteria matching the type, no unknown keys — see
+// [ParseQuestions]). Every validation defect is an error and the backend is
+// never contacted for an invalid request.
+//
+// The request carries exactly {model, state, questions}: the configured
+// model, the state (string, object, or array — number lexemes inside
+// objects/arrays are preserved), and the questions in the order given.
+func (c *SystemOneClient) Decision(ctx context.Context, state State, questions []Question) (json.RawMessage, error) {
 	if ctx == nil {
 		return nil, errors.New(errPrefix + "nil context")
 	}
-
-	// Normalize a nil/empty question list to an empty JSON array so the wire
-	// shape always carries an array, never null.
-	qs := questions
-	if qs == nil {
-		qs = []string{}
+	if err := validateRequest(state, questions); err != nil {
+		return nil, err
 	}
-	rawRequest, err := json.Marshal(systemOneRequest{Model: c.model, State: state, Questions: qs})
+
+	rawRequest, err := json.Marshal(systemOneRequest{Model: c.model, State: state, Questions: questions})
 	if err != nil {
 		return nil, fmt.Errorf(errPrefix+"encode request: %w", err)
 	}
