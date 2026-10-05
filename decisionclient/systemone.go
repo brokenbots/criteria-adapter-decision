@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // errPrefix tags every error produced by this package so failures are
@@ -63,6 +64,10 @@ type SystemOneClient struct {
 	// hc issues the requests. Unexported; a fresh client with no timeout is
 	// created by New so concurrent users never share a mutable default.
 	hc *http.Client
+	// retries is the transport retry knob: extra attempts (beyond the first)
+	// for 429/5xx responses, honoring Retry-After. Zero — the New default —
+	// keeps retries disabled; workflow-level retries live graph-side.
+	retries int
 }
 
 // New creates a SystemOneClient that POSTs the System One wire format to
@@ -117,14 +122,30 @@ func New(baseURL, model string, apiKey ...string) (*SystemOneClient, error) {
 		model:    model,
 		apiKey:   key,
 		hc:       &http.Client{},
+		retries:  0,
 	}
 	return client, nil
+}
+
+// WithRetries returns a copy of the client with the transport retry knob set
+// to maxRetries extra attempts for 429/5xx responses, honoring the
+// Retry-After header of the failed response when present. The knob is
+// disabled (0) by default per ADR-0013 D5: only the callers that opt in pay
+// the extra backends traffic, and workflow-level retries stay graph-side.
+// A negative value is clamped to 0 — there is no default-on interpretation.
+// The copy shares the underlying HTTP client (safe for concurrent use) and
+// the receiver is left untouched.
+func (c *SystemOneClient) WithRetries(maxRetries int) *SystemOneClient {
+	cp := *c
+	cp.retries = max(0, maxRetries)
+	return &cp
 }
 
 // Decision posts the decision request for state and questions to the backend
 // and returns its raw JSON response body verbatim — no decoding, no
 // re-encoding, byte-identical to what the backend sent. Decode the response
-// with [DecodeAnswers] against the same questions.
+// with [DecodeDecisionResponse] for the full {model, answers, usage}
+// envelope (the answers-only view remains [DecodeAnswers]).
 //
 // The request is validated FAIL-CLOSED before any HTTP traffic: the state
 // must be a JSON string, object, or array, and every question must pass the
@@ -132,6 +153,16 @@ func New(baseURL, model string, apiKey ...string) (*SystemOneClient, error) {
 // instructions, criteria matching the type, no unknown keys — see
 // [ParseQuestions]). Every validation defect is an error and the backend is
 // never contacted for an invalid request.
+//
+// Failures are typed [DecisionError] values: kind, HTTP status, retryability
+// and message are inspectable without string matching, which is what adapters
+// map onto failure outcomes.
+//
+// The transport retry knob is disabled by default (retries 0: exactly one
+// attempt). When enabled via [SystemOneClient.WithRetries], 429/5xx
+// responses are retried up to the configured extra attempts, waiting the
+// response's Retry-After when prescribed; every other failure class (auth,
+// timeout, decode, transport, cancel) returns immediately.
 //
 // The request carries exactly {model, state, questions}: the configured
 // model, the state (string, object, or array — number lexemes inside
@@ -149,6 +180,32 @@ func (c *SystemOneClient) Decision(ctx context.Context, state State, questions [
 		return nil, fmt.Errorf(errPrefix+"encode request: %w", err)
 	}
 
+	for attempt := 0; ; attempt++ {
+		raw, err := c.attempt(ctx, rawRequest)
+		if err == nil {
+			return raw, nil
+		}
+		// 429/5xx only, and only while extra attempts remain; the wait is
+		// the failed response's Retry-After (zero = immediate retry).
+		var de *DecisionError
+		if attempt >= c.retries || !errors.As(err, &de) || de.Kind != DecisionErrorKindHTTP || !isRetryStatus(de.Status) {
+			return nil, err
+		}
+		if de.retryAfter > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, contextError(c.endpoint, ctx.Err())
+			case <-time.After(de.retryAfter):
+			}
+		}
+	}
+}
+
+// attempt performs one Decision exchange: build, send, read, and verify the
+// response envelope bounds. Success returns the raw body verbatim; failure
+// returns a typed [DecisionError] (or a plain error for pre-flight request
+// construction defects, which no retry can fix).
+func (c *SystemOneClient) attempt(ctx context.Context, rawRequest []byte) (json.RawMessage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(rawRequest))
 	if err != nil {
 		return nil, fmt.Errorf(errPrefix+"build request: %w", err)
@@ -163,24 +220,46 @@ func (c *SystemOneClient) Decision(ctx context.Context, state State, questions [
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf(errPrefix+"POST %s: %w", c.endpoint, err)
+		return nil, transportError(c.endpoint, err)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf(errPrefix+"read response: %w", err)
+		return nil, &DecisionError{
+			Kind:      DecisionErrorKindTransport,
+			Status:    0,
+			Retryable: true,
+			Message:   fmt.Sprintf(errPrefix+"read response: %v", err),
+			cause:     err,
+		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf(errPrefix+"POST %s: unexpected status %s: %s", c.endpoint, resp.Status, bodyExcerpt(raw))
+		return nil, statusError(c.endpoint, resp, bodyExcerpt(raw))
 	}
 	if len(raw) > maxResponseBytes {
-		return nil, fmt.Errorf(errPrefix+"response exceeds %d bytes; refusing the truncated body", maxResponseBytes)
+		return nil, decodeError(fmt.Sprintf(errPrefix+"response exceeds %d bytes; refusing the truncated body", maxResponseBytes))
 	}
 	if !json.Valid(raw) {
-		return nil, errors.New(errPrefix + "response is not valid JSON")
+		return nil, decodeError(errPrefix + "response is not valid JSON")
 	}
 	return json.RawMessage(raw), nil
+}
+
+// contextError types a context failure surfaced mid-retry-wait (the caller's
+// deadline or cancellation cut the backoff short).
+func contextError(endpoint string, ctxErr error) *DecisionError {
+	de := &DecisionError{
+		Message: fmt.Sprintf(errPrefix+"POST %s: %v", endpoint, ctxErr),
+		cause:   ctxErr,
+	}
+	if errors.Is(ctxErr, context.Canceled) {
+		de.Kind = DecisionErrorKindCanceled
+	} else {
+		de.Kind = DecisionErrorKindTimeout
+		de.Retryable = true
+	}
+	return de
 }
 
 // bodyExcerpt renders the first maxErrorBodyBytes bytes of a response body
