@@ -70,10 +70,10 @@ func TestInfo(t *testing.T) {
 // question. The state is supplied per test.
 const executeValidQuestionsJSON = `[{"id":"verdict","type":"noul","instructions":"Is the run safe?"}]`
 
-// answerVerbatim is the verbatim answers array the test backend returns,
-// deliberately padded with asymmetric whitespace to pin byte-verbatim
-// passthrough.
-const answerVerbatim = `[ {"id":"verdict","noul":"yes"} ]`
+// answerVerbatim is the verbatim answers map the test backend returns,
+// keyed by question id and deliberately padded with asymmetric whitespace
+// to pin byte-verbatim passthrough.
+const answerVerbatim = `{ "verdict":{"type":"noul","noul":"yes"} }`
 
 // usageVerbatim is the verbatim usage object the test backend returns, with
 // deliberately uneven internal formatting to pin byte-verbatim passthrough.
@@ -337,14 +337,14 @@ func TestExecuteSuccessPassthroughVerbatim(t *testing.T) {
 	if got := payload["model"]; got != "sysone-1" {
 		t.Errorf("event model = %v; want sysone-1", got)
 	}
-	// The answers ride the event as the native per-question view.
-	answers, ok := payload["answers"].([]any)
+	// The answers ride the event as the native map view (keyed by question id).
+	answers, ok := payload["answers"].(map[string]any)
 	if !ok || len(answers) != 1 {
-		t.Fatalf("event answers = %#v; want one native answer object", payload["answers"])
+		t.Fatalf("event answers = %#v; want the native per-question answers map", payload["answers"])
 	}
-	answer, ok := answers[0].(map[string]any)
-	if !ok || answer["id"] != "verdict" || answer["noul"] != "yes" {
-		t.Errorf("event answer = %#v; want the per-question answer", answers[0])
+	answer, ok := answers["verdict"].(map[string]any)
+	if !ok || answer["type"] != "noul" || answer["noul"] != "yes" {
+		t.Errorf("event answer for \"verdict\" = %#v; want the per-question answer", answers["verdict"])
 	}
 	usage, ok := payload["usage"].(map[string]any)
 	if !ok || usage["input_tokens"] != float64(812) {
@@ -417,7 +417,7 @@ func TestExecuteFailureMappingMatrix(t *testing.T) {
 		},
 		{
 			name:        "malformed response body is decode",
-			exchanges:   []stubExchange{{body: `{"model":"sysone-1","answers":[{"id":"verdict","noul":"hmm"}]}`}},
+			exchanges:   []stubExchange{{body: `{"model":"sysone-1","answers":{"verdict":{"type":"noul","noul":"hmm"}}}`}},
 			wantKind:    "decode",
 			wantStatus:  0,
 			wantRetry:   false,
@@ -896,10 +896,10 @@ func TestLogReturnsPromptly(t *testing.T) {
 // out-of-set for the mapping.
 const mappingQuestionsJSON = `[{"id":"route","type":"choice","instructions":"Route the run.","criteria":{"success":"take the success branch","failure":"take the failure branch","abort":"abandon the run"}},{"id":"verdict","type":"noul","instructions":"Is the run safe?"}]`
 
-// mappingAnswer returns the verbatim answers array for mappingQuestionsJSON
+// mappingAnswer returns the verbatim answers map for mappingQuestionsJSON
 // with the given choice selected for "route".
 func mappingAnswer(choice string) string {
-	return fmt.Sprintf(`[{"id":"route","choice":%q,"probabilities":{"abort":0.1,"failure":0.2,"success":0.7},"confidence":0.9},{"id":"verdict","noul":"yes"}]`, choice)
+	return fmt.Sprintf(`{"route":{"type":"choice","choice":%q,"probabilities":{"abort":0.1,"failure":0.2,"success":0.7},"confidence":0.9},"verdict":{"type":"noul","noul":"yes"}}`, choice)
 }
 
 // mappingResponse returns the full success response body with the given
@@ -1246,10 +1246,11 @@ func TestInfoInputContract(t *testing.T) {
 }
 
 // TestInfoOutputContract pins the compile-time output contract: exactly
-// answers (array), usage (object), and error (object — the typed failure
-// payload; compileOutputRefs rejects refs to undeclared output keys, so
-// failure-routing workflows compile only with error declared). None is
-// Required: the emitted payload depends on the step outcome.
+// answers (map keyed by question id), usage (object), and error (object —
+// the typed failure payload; compileOutputRefs rejects refs to undeclared
+// output keys, so failure-routing workflows compile only with error
+// declared). None is Required: the emitted payload depends on the step
+// outcome.
 func TestInfoOutputContract(t *testing.T) {
 	resp, err := newTestService().Info(context.Background(), &v2.InfoRequest{})
 	if err != nil {
@@ -1257,7 +1258,7 @@ func TestInfoOutputContract(t *testing.T) {
 	}
 	fields := resp.GetOutputSchema().GetFields()
 	want := map[string]string{
-		"answers": "array",
+		"answers": "object",
 		"usage":   "object",
 		"error":   "object",
 	}
